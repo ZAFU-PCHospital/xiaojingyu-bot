@@ -1,0 +1,11 @@
+name: astrbot_plugin_silent_filter
+display_name: 群友小鲸鱼回复控制
+short_desc: 指定群友会话10%随机参与、独立消息分段与SILENT清理。
+desc: 仅处理明确配置的群友会话，普通消息概率参与，原生唤醒正常回复；官方Webhook纯文本最多分成三条独立消息，不影响客服群。
+version: v0.3
+author: local
+astrbot_version: ">=4.16,<5"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - qq_official_webhook

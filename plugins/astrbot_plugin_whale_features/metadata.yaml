@@ -1,0 +1,6 @@
+name: astrbot_plugin_whale_features
+display_name: 小鲸鱼分群扩展
+desc: 群友链接摘要、群聊回顾、Steam订阅；管理待办、进展和通知；客服硬件查询
+version: v0.1.0
+author: Xiaoyuan
+repo: ""

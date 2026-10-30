@@ -1,0 +1,8 @@
+name: astrbot_plugin_management_whale
+display_name: 管理小鲸鱼
+desc: 指定管理群整理GitHub Issue和义修活动草稿，由真实群消息确认最新版本后执行。
+version: v0.1.0
+author: Xiaoyuan
+astrbot_version: ">=4.29,<5"
+support_platforms:
+  - qq_official_webhook

@@ -1,0 +1,2374 @@
+"""
+AstrBot 长期记忆插件主入口
+
+功能:
+- LLM 请求前注入记忆上下文
+- LLM 响应后自动提取记忆
+- 提供记忆管理命令
+- 提供 LLM 工具供 AI 主动操作记忆
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import re
+import shlex
+import time
+from typing import TYPE_CHECKING, Any
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.provider import LLMResponse, ProviderRequest
+from astrbot.api.star import Context, Star
+
+from .maintenance.scheduler import MaintenanceScheduler
+from .memory_manager import (
+    MemoryManager,
+    _debug_content_summary,
+    _debug_memory_summary,
+    normalize_domain,
+)
+from .memory_protocol import (
+    MemoryScope,
+    MemoryType,
+    MemoryURI,
+    UMOInfo,
+    format_memory_for_injection,
+    format_memory_for_user,
+    validate_owner_ids,
+)
+from .recall_utils import bound_query, query_max_chars, recall_timeout
+
+if TYPE_CHECKING:
+    from .memory_manager import MemoryManager
+
+# 提取解析共享逻辑已抽至 extraction_utils（maintenance.agents.curator 共用），
+# 以下同名别名仅为兼容外部引用而保留（re-export），本文件内不再直接使用
+from .extraction_utils import (
+    normalize_extracted_scope as _normalize_extracted_scope,  # noqa: F401
+)
+from .extraction_utils import (
+    normalize_subject_id as _normalize_subject_id,  # noqa: F401
+)
+from .extraction_utils import (
+    normalize_subject_ids as _normalize_subject_ids,  # noqa: F401
+)
+from .extraction_utils import (
+    parse_extracted_memories as _shared_parse_extracted_memories,
+)
+from .extraction_utils import (
+    sanitize_string_list as _sanitize_string_list,  # noqa: F401
+)
+from .extraction_utils import (
+    strip_json_fence as _strip_json_fence_text,
+)
+from .prompts import (
+    ALLOWED_MEMORY_TYPES,
+    MEMORY_CONSOLIDATION_PROMPT,
+    MEMORY_EXTRACTION_PROMPT,
+    RECALL_QUERY_PROMPT,
+    VALID_TOOL_DOMAINS,
+    VALID_TOOL_SCOPES,
+)
+from .prompts import (
+    sanitize_memory_content as _sanitize_memory_content,
+)
+
+DEFAULT_RECALL_QUERY_OPTIMIZATION_TIMEOUT = 10
+DEFAULT_MAX_SESSION_SNAPSHOTS = 20
+DEFAULT_MAX_SNAPSHOT_CHARS = 8000
+
+
+def _current_speaker_subject(event: AstrMessageEvent, scope: str) -> str:
+    parsed = UMOInfo.parse(event.unified_msg_origin)
+    if scope == MemoryScope.GROUP:
+        return parsed.session_id
+    if scope == MemoryScope.CONVERSATION:
+        return event.unified_msg_origin
+    return event.get_sender_id()
+
+
+def _flatten_content(content: Any) -> str:
+    """将内容转换为字符串"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(_flatten_content(item) for item in content)
+    if isinstance(content, dict):
+        return content.get("text", "") or content.get("content", "")
+    return str(content)
+
+
+def _normalize_contexts(contexts: Any) -> list[dict[str, Any]]:
+    """标准化 contexts 为列表"""
+    return list(contexts) if isinstance(contexts, list) else []
+
+
+def _build_recall_query(
+    prompt: str, contexts: list[dict[str, Any]], max_chars: int = 1200
+) -> str:
+    """优先保留当前提问，用剩余预算补最近的自然语言上下文。"""
+    query = bound_query(prompt, max_chars)
+    for ctx in reversed(contexts[-3:]):
+        if not isinstance(ctx, dict) or ctx.get("role") not in {"user", "assistant"}:
+            continue
+        remaining = max_chars - len(query)
+        if remaining <= 15:
+            break
+        content = _flatten_content(ctx.get("content", ""))
+        if content:
+            query += f"\n[{ctx['role']}]: {content[:400]}"[:remaining]
+    return query.strip()
+
+
+def _make_memory_text_part(content: str) -> Any | None:
+    """构造 AstrBot 用户内容块；新版支持标记为本轮临时内容。"""
+    try:
+        from astrbot.core.agent.message import TextPart
+    except Exception:
+        return None
+
+    part = TextPart(text=content)
+    mark_as_temp = getattr(part, "mark_as_temp", None)
+    if callable(mark_as_temp):
+        marked_part = mark_as_temp()
+        if marked_part is not None:
+            part = marked_part
+    return part
+
+
+def _append_extra_user_content(request: ProviderRequest, content: str) -> bool:
+    """优先使用 AstrBot 动态用户内容块注入记忆。"""
+    if not hasattr(request, "extra_user_content_parts"):
+        return False
+
+    parts = getattr(request, "extra_user_content_parts", None)
+    if parts is None:
+        parts = []
+        request.extra_user_content_parts = parts
+    if not hasattr(parts, "append"):
+        return False
+
+    part = _make_memory_text_part(content)
+    if part is None:
+        return False
+
+    parts.append(part)
+    return True
+
+
+def _inject_memory_context(request: ProviderRequest, content: str) -> str:
+    """注入记忆上下文，返回实际使用的注入位置。"""
+    if _append_extra_user_content(request, content):
+        return "extra_user_content_parts"
+
+    contexts = _normalize_contexts(getattr(request, "contexts", None))
+    memory_msg = {"role": "user", "content": content}
+    # 旧版回退：放在 contexts 最前面，使当前 prompt 仍保持最后、优先级更高。
+    request.contexts = [memory_msg] + contexts
+    return "contexts 顶部"
+
+
+def _clamp_timeout(
+    value: Any, default: int = DEFAULT_RECALL_QUERY_OPTIMIZATION_TIMEOUT
+) -> int:
+    try:
+        timeout = int(value)
+    except (TypeError, ValueError):
+        timeout = default
+    return max(1, min(20, timeout))
+
+
+def _read_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(0, parsed)
+
+
+def _confirmation_code(action: str, target: str = "") -> str:
+    seed = f"{action}:{target}".encode()
+    digest = hashlib.sha256(seed).hexdigest()[:8]
+    return f"{action}-{digest}"
+
+
+ADMIN_MANAGED_SCOPES = {
+    MemoryScope.GLOBAL,
+    MemoryScope.PERSONAL,
+    MemoryScope.GROUP,
+    MemoryScope.CONVERSATION,
+}
+ADMIN_SCOPE_OWNER_FIELDS = {
+    MemoryScope.PERSONAL: "owner_user_id",
+    MemoryScope.GROUP: "owner_session_id",
+    MemoryScope.CONVERSATION: "umo",
+}
+
+
+def _format_admin_removal_preview(
+    uri: str,
+    scope: str,
+    owner_id: str,
+    preview: dict[str, Any],
+    confirmation_code: str,
+    owner_field: str = "",
+) -> str:
+    """渲染管理员记忆删除预览，不输出完整正文。"""
+    records = preview.get("records", [])
+    lines = [
+        "[Administrator memory removal confirmation]",
+        f"URI: {uri}",
+        f"Scope: {scope}",
+        f"Owner: {owner_id or 'global'}",
+        f"Matching active records: {preview.get('count', 0)}",
+    ]
+    for index, record in enumerate(records[:10], start=1):
+        lines.append(
+            f"{index}. len={record.get('content_len', 0)}, "
+            f"sha256={record.get('content_sha256', '')}, "
+            f"preview={record.get('preview', '')}"
+        )
+    if len(records) > 10:
+        lines.append(f"... {len(records) - 10} more matching records")
+    target_args = f"uri='{uri}', scope='{scope}'"
+    if owner_field:
+        target_args += f", owner_id='{owner_id}'"
+    lines.append(
+        "No deletion has occurred. To confirm the exact current records, call "
+        f"memory_remove_admin({target_args}, confirm='{confirmation_code}')."
+    )
+    return "\n".join(lines)
+
+
+def _render_cmd_prefix(prefix: str) -> str:
+    return prefix or "/"
+
+
+def _parse_command_args(event: AstrMessageEvent, full_cmd: str) -> str:
+    """从 event.message_str 提取命令名之后的原始参数文本
+
+    AstrBot 在进入 handler 前已剥离 wake prefix（如 /），
+    因此 event.message_str 实际格式为 "memory list 1" 而非 "/memory list 1"。
+    内部先做与 AstrBot 一致的空白规范化再截断命令名。
+    """
+    msg = re.sub(r"\s+", " ", event.message_str.strip())
+    if msg.startswith(full_cmd):
+        remainder = msg[len(full_cmd) :].strip()
+        return remainder
+    return msg
+
+
+def _parse_memory_flags(args_text: str) -> dict[str, Any]:
+    """解析 --all / --user <id> / --to <name> / --clear-cache / --confirm 标志
+
+    Returns:
+        {"all": bool, "user": str, "to": str, "clear_cache": bool,
+         "confirm": str, "positional": str,
+         "user_missing_value": bool, "to_missing_value": bool,
+         "unknown_flags": list[str]}
+    """
+    result: dict[str, Any] = {
+        "all": False,
+        "user": "",
+        "to": "",
+        "clear_cache": False,
+        "confirm": "",
+        "positional": "",
+        "user_missing_value": False,
+        "to_missing_value": False,
+        "confirm_missing_value": False,
+        "parse_error": "",
+        "unknown_flags": [],
+    }
+    try:
+        tokens = shlex.split(args_text)
+    except ValueError as e:
+        result["parse_error"] = str(e)
+        return result
+    i = 0
+    positional_parts = []
+    while i < len(tokens):
+        token = tokens[i]
+        if token == "--all":
+            result["all"] = True
+        elif token == "--user":
+            if i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
+                i += 1
+                result["user"] = tokens[i]
+            else:
+                result["user_missing_value"] = True
+        elif token == "--to":
+            if i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
+                i += 1
+                result["to"] = tokens[i]
+            else:
+                result["to_missing_value"] = True
+        elif token == "--clear-cache":
+            result["clear_cache"] = True
+        elif token == "--confirm":
+            if i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
+                i += 1
+                result["confirm"] = tokens[i]
+            else:
+                result["confirm_missing_value"] = True
+        elif token.startswith("--"):
+            result["unknown_flags"].append(token)
+        else:
+            positional_parts.append(token)
+        i += 1
+    result["positional"] = " ".join(positional_parts).strip()
+    return result
+
+
+def _ensure_initialized(memory_mgr: MemoryManager | None) -> str | None:
+    """检查记忆管理器是否就绪，返回错误消息或 None"""
+    if not memory_mgr:
+        return "长期记忆插件未正确初始化，请检查配置"
+    return None
+
+
+def _validate_command(
+    event: AstrMessageEvent,
+    args: dict[str, Any],
+    *,
+    cmd_name: str,
+    require_admin: bool = False,
+    allow_all: bool = False,
+    allow_user: bool = False,
+    allow_to: bool = False,
+    allow_clear_cache: bool = False,
+    allow_confirm: bool = False,
+    allow_positional: bool = True,
+) -> str | None:
+    """统一的命令参数校验，返回首个错误消息或 None。
+
+    校验顺序与原各命令保持一致：未知 flag → user 缺值 → to 缺值 →
+    各 flag 是否被允许 → positional → 管理员权限 → --all 管理员权限。
+    """
+    if args["unknown_flags"]:
+        return f"未知参数: {', '.join(args['unknown_flags'])}"
+    if args["parse_error"]:
+        return f"参数解析失败: {args['parse_error']}"
+    if args["user_missing_value"]:
+        return "--user 需要指定用户 ID"
+    if args["to_missing_value"]:
+        if not allow_to:
+            return f"{cmd_name} 命令不支持 --to 参数"
+        return "需要指定知识库名称，用法: /memory rebuild --to <知识库名>"
+    if args["confirm_missing_value"]:
+        if not allow_confirm:
+            return f"{cmd_name} 命令不支持 --confirm 参数"
+        return "--confirm 需要指定确认码"
+    if not allow_user and args["user"]:
+        return f"{cmd_name} 命令不支持 --user 参数"
+    if not allow_to and args["to"]:
+        return f"{cmd_name} 命令不支持 --to 参数"
+    if not allow_clear_cache and args["clear_cache"]:
+        return f"{cmd_name} 命令不支持 --clear-cache 参数"
+    if not allow_confirm and args["confirm"]:
+        return f"{cmd_name} 命令不支持 --confirm 参数"
+    if not allow_all and args["all"]:
+        return f"{cmd_name} 命令不支持 --all 参数"
+    if not allow_positional and args["positional"]:
+        return f"未知参数: {args['positional']}"
+    if require_admin and not event.is_admin():
+        return "该操作需要管理员权限"
+    if args["all"] and not event.is_admin():
+        return "--all 标志需要管理员权限"
+    return None
+
+
+class MemoryPlugin(Star):
+    """长期记忆插件"""
+
+    # 请求快照过期时间（秒）
+    SNAPSHOT_TTL = 300  # 5 分钟
+    SNAPSHOT_CLEANUP_INTERVAL = 60
+    TTL_EXPIRE_INTERVAL = 3600  # TTL 过期扫描间隔（秒）
+    CONSOLIDATION_INTERVAL = 7200  # 记忆巩固扫描间隔（秒）
+    MAX_SESSION_SNAPSHOTS = DEFAULT_MAX_SESSION_SNAPSHOTS
+    MAX_SNAPSHOT_CHARS = DEFAULT_MAX_SNAPSHOT_CHARS
+
+    def __init__(self, context: Context, config=None):
+        super().__init__(context, config)
+        self.config = config or {}
+        self.memory_mgr: MemoryManager | None = None
+        # 实例级请求快照字典，按 session_key 键控，避免跨用户污染
+        # 结构: {session_key: {"snapshots": [...], "timestamp": float}}
+        # snapshots 是一个列表，累积多轮对话
+        self._request_snapshots: dict[str, dict[str, Any]] = {}
+        # 每个会话的对话计数器
+        self._session_counters: dict[str, int] = {}
+        self._last_snapshot_cleanup = 0.0
+        self._last_ttl_expire = 0.0
+        self._last_consolidation = 0.0
+        self._background_tasks: set[asyncio.Task] = set()
+        self._scheduler: MaintenanceScheduler | None = None
+
+    async def initialize(self):
+        """插件初始化：校验配置，并尝试立即连接 KB（重载场景）"""
+        try:
+            self.memory_mgr = MemoryManager(
+                kb_mgr=self.context.kb_manager,
+                config=self.config,
+                kv_put=self.put_kv_data,
+                kv_get=self.get_kv_data,
+                kv_delete=self.delete_kv_data,
+            )
+            self.memory_mgr.initialize()
+        except Exception as e:
+            logger.error(f"[简单长期记忆] 配置校验失败: {e}")
+            self.memory_mgr = None
+            return
+
+        # 尝试立即连接 KB（热重载时 KB 已就绪）
+        try:
+            await self.memory_mgr.connect_kb()
+            logger.info("[简单长期记忆] 插件初始化成功")
+            await self._start_scheduler()
+        except Exception:
+            # 首次启动时 KB 尚未就绪，由 on_astrbot_loaded 钩子处理
+            logger.info("[简单长期记忆] 配置校验通过，等待知识库就绪")
+
+    @filter.on_astrbot_loaded()
+    async def on_loaded(self):
+        if not self.memory_mgr or self.memory_mgr.is_kb_connected:
+            # KB 已连接（热重载场景），但仍需检查中断恢复
+            if self.memory_mgr:
+                await self._recover_interrupted_rebuild()
+            return
+        connected = False
+        try:
+            await self.memory_mgr.connect_kb()
+            connected = True
+            logger.info("[简单长期记忆] 插件初始化成功")
+        except Exception as e:
+            logger.error(f"[简单长期记忆] 连接知识库失败，将先尝试恢复重建缓存: {e}")
+
+        # 检测上次中断的重建：主快照可按缓存中的目标 KB ID 恢复，
+        # 不强依赖当前配置的源 KB 仍然可连接。
+        await self._recover_interrupted_rebuild()
+
+        if not connected:
+            self.memory_mgr = None
+            return
+
+        await self._start_scheduler()
+
+    async def _recover_interrupted_rebuild(self) -> None:
+        """启动时检测并恢复上次中断的重建
+
+        恢复优先级：
+        1. 主数据快照 (rebuild_memory_records) — 从中断点继续重建
+        2. 缓冲写入 (rebuild_pending_writes) — flush 未处理的写入
+        无论主数据快照是否恢复成功，都继续处理缓冲写入。
+        """
+        if not self.memory_mgr:
+            return
+
+        # 优先恢复主数据快照（更严重的崩溃场景）
+        try:
+            rebuild_status = await self.get_kv_data("rebuild_status", None)
+            memory_records = await self.get_kv_data("rebuild_memory_records", None)
+            rebuild_context = await self.get_kv_data("rebuild_context", None)
+
+            if (
+                rebuild_status == "in_progress"
+                and not memory_records
+                and not self.memory_mgr.is_rebuilding
+            ):
+                await self.put_kv_data("rebuild_status", "interrupted")
+                rebuild_status = "interrupted"
+
+            if (
+                rebuild_status in {"in_progress", "interrupted"}
+                and memory_records
+                and isinstance(memory_records, list)
+            ):
+                logger.warning(
+                    f"[简单长期记忆] 检测到未完成的重建，"
+                    f"状态: {rebuild_status}, "
+                    f"主数据快照 {len(memory_records)} 条，正在恢复..."
+                )
+                # 从 KV 快照继续重建（不重新拉取源 KB，因为可能已被清空）
+                recovery_result = await self.memory_mgr._resume_rebuild_from_snapshot(
+                    memory_records,
+                    rebuild_context if isinstance(rebuild_context, dict) else None,
+                )
+                recovered = recovery_result["success"]
+                remaining_records = recovery_result["remaining_records"]
+
+                if recovered:
+                    logger.info(f"[简单长期记忆] 主数据快照恢复完成: {recovered} 条")
+
+                if remaining_records:
+                    logger.warning(
+                        f"[简单长期记忆] 仍有 {len(remaining_records)} 条快照"
+                        "未恢复，已保留到 KV，等待下次继续恢复"
+                    )
+                    await self.put_kv_data("rebuild_memory_records", remaining_records)
+                    await self.put_kv_data("rebuild_status", "interrupted")
+                else:
+                    await self.delete_kv_data("rebuild_memory_records")
+                    await self.put_kv_data("rebuild_status", "completed")
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 恢复主数据快照失败: {e}")
+            try:
+                await self.put_kv_data("rebuild_status", "interrupted")
+            except Exception:
+                pass
+
+        # 无论主数据快照是否恢复成功，都继续恢复缓冲写入
+        try:
+            pending = await self.get_kv_data("rebuild_pending_writes", None)
+            if not pending or not isinstance(pending, list):
+                return
+            self.memory_mgr.load_pending_writes(pending)
+            flushed = await self.memory_mgr._flush_pending_writes()
+            if flushed:
+                logger.info(
+                    f"[简单长期记忆] 已恢复上次中断的缓冲写入: "
+                    f"{len(pending)} 条中写入 {flushed} 条"
+                )
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 恢复缓冲写入失败: {e}")
+
+    async def terminate(self):
+        """插件销毁"""
+        if self._scheduler:
+            await self._scheduler.stop()
+            self._scheduler = None
+        self._request_snapshots.clear()
+        self._session_counters.clear()
+        logger.info("[简单长期记忆] 插件已卸载")
+
+    async def _start_scheduler(self) -> None:
+        """KB 连接后启动后台整理调度器。"""
+        if not self.memory_mgr or not self.memory_mgr.is_kb_connected:
+            return
+        if self._scheduler:
+            return  # 已启动
+        self._scheduler = MaintenanceScheduler(
+            context=self.context,
+            memory_mgr=self.memory_mgr,
+            config=self.config,
+            kv_put=self.put_kv_data,
+            kv_get=self.get_kv_data,
+        )
+        await self._scheduler.start()
+
+    def _get_display_timezone(self) -> str | None:
+        """读取 AstrBot 全局时区，用于注入内容的时间展示。"""
+        try:
+            return self.context.astrbot_config.get("timezone") or None
+        except Exception:
+            return None
+
+    def _get_viewer_user_id(self, event: AstrMessageEvent) -> str | None:
+        """获取当前会话用户 ID，用于标注共享记忆归属。"""
+        if not self.memory_mgr:
+            return None
+        try:
+            return self.memory_mgr._current_owner_user_id(event)
+        except Exception:
+            return None
+
+    def _get_cmd_prefix(self) -> str:
+        """从 AstrBot 配置读取命令前缀，默认 /"""
+        try:
+            prefixes = self.context.astrbot_config.get("wake_prefix", [])
+            if prefixes and isinstance(prefixes, list):
+                return prefixes[0]
+        except Exception:
+            pass
+        return "/"
+
+    async def _get_llm_provider_id(
+        self, event: AstrMessageEvent, provider_type: str
+    ) -> str | None:
+        """获取 LLM Provider ID
+
+        优先使用配置中指定的 Provider，否则使用会话主 LLM
+
+        Args:
+            event: 消息事件
+            provider_type: 'extraction' 或 'summarization'
+
+        Returns:
+            Provider ID 或 None
+        """
+        config_key = f"{provider_type}_provider_id"
+        provider_id = self.config.get(config_key, "")
+
+        if provider_id:
+            return provider_id
+
+        # 使用会话主 LLM
+        try:
+            return await self.context.get_current_chat_provider_id(
+                event.unified_msg_origin
+            )
+        except Exception:
+            return None
+
+    # ==================== 请求快照管理 ====================
+
+    def _get_session_key(self, event: AstrMessageEvent) -> str:
+        """获取会话唯一标识，用于请求-响应关联
+
+        使用 unified_msg_origin 作为会话键，确保同一会话的请求和响应正确匹配
+        """
+        return event.unified_msg_origin
+
+    def _accumulate_request_snapshot(
+        self, event: AstrMessageEvent, request: ProviderRequest
+    ) -> None:
+        """累积请求快照（在请求阶段调用）"""
+        if _read_positive_int(self.config.get("extraction_interval", 20), 20) <= 0:
+            self._discard_session_snapshots(event)
+            return
+
+        session_key = self._get_session_key(event)
+        current_time = time.time()
+
+        if session_key not in self._request_snapshots:
+            self._request_snapshots[session_key] = {
+                "snapshots": [],
+                "pending_prompt": None,
+                "timestamp": current_time,
+            }
+
+        # 存储待匹配的请求
+        self._request_snapshots[session_key]["pending_prompt"] = (request.prompt or "")[
+            : self.MAX_SNAPSHOT_CHARS
+        ]
+        self._request_snapshots[session_key]["pending_sender_id"] = (
+            event.get_sender_id()
+        )
+        self._request_snapshots[session_key]["timestamp"] = current_time
+
+        self._cleanup_expired_snapshots(current_time)
+
+    def _complete_snapshot_with_response(
+        self, event: AstrMessageEvent, response_text: str
+    ) -> None:
+        """用响应完成快照（在响应阶段调用）"""
+        session_key = self._get_session_key(event)
+        entry = self._request_snapshots.get(session_key)
+
+        if not entry or not entry.get("pending_prompt"):
+            return
+
+        # 创建完整的快照
+        snapshot = {
+            "prompt": entry["pending_prompt"],
+            "response": response_text[: self.MAX_SNAPSHOT_CHARS],
+            "sender_id": entry.get("pending_sender_id", event.get_sender_id()),
+        }
+        entry["snapshots"].append(snapshot)
+        if len(entry["snapshots"]) > self.MAX_SESSION_SNAPSHOTS:
+            del entry["snapshots"][: -self.MAX_SESSION_SNAPSHOTS]
+
+        # 清除待匹配状态
+        entry["pending_prompt"] = None
+        entry["pending_sender_id"] = ""
+
+    def _get_session_snapshot_count(self, event: AstrMessageEvent) -> int:
+        """获取会话的快照数量"""
+        session_key = self._get_session_key(event)
+        entry = self._request_snapshots.get(session_key)
+        if not entry:
+            return 0
+        return len(entry.get("snapshots", []))
+
+    def _get_and_clear_session_snapshots(
+        self, event: AstrMessageEvent
+    ) -> list[dict[str, Any]]:
+        """获取并清空会话的快照列表"""
+        session_key = self._get_session_key(event)
+        entry = self._request_snapshots.get(session_key)
+        if not entry:
+            return []
+
+        snapshots = entry.get("snapshots", [])
+        # 清空快照列表但保留会话条目
+        entry["snapshots"] = []
+        return snapshots
+
+    def _discard_session_snapshots(self, event: AstrMessageEvent) -> None:
+        """清理当前会话快照和计数器"""
+        session_key = self._get_session_key(event)
+        self._request_snapshots.pop(session_key, None)
+        self._session_counters.pop(session_key, None)
+
+    def _increment_session_counter(self, event: AstrMessageEvent) -> int:
+        """递增会话对话计数器并返回当前值"""
+        key = self._get_session_key(event)
+        self._session_counters[key] = self._session_counters.get(key, 0) + 1
+        return self._session_counters[key]
+
+    async def _maybe_expire_stale_memories(self) -> None:
+        """节流触发 TTL 过期（P1.1）。仿 _cleanup_expired_snapshots 的间隔模式。"""
+        now = time.time()
+        if now - self._last_ttl_expire < self.TTL_EXPIRE_INTERVAL:
+            return
+        self._last_ttl_expire = now
+        mgr = self.memory_mgr
+        if not mgr or not mgr.is_kb_connected:
+            return
+        ttl_days = _read_positive_int(self.config.get("memory_ttl_days", 30), 30)
+        if ttl_days <= 0:
+            return
+        try:
+            expired = await mgr.expire_stale_memories(ttl_days)
+            if expired:
+                logger.info(f"[简单长期记忆] TTL 过期标记 {expired} 条记忆")
+        except Exception as e:
+            logger.debug(f"[简单长期记忆] TTL 过期任务失败: {e}")
+
+    async def _maybe_consolidate_memories(self, event: AstrMessageEvent) -> None:
+        """节流触发记忆巩固（P1.2）：低频老记忆 → LLM 总结 → 摘要记忆 + 原文标记。"""
+        now = time.time()
+        if now - self._last_consolidation < self.CONSOLIDATION_INTERVAL:
+            return
+        self._last_consolidation = now
+        mgr = self.memory_mgr
+        if not mgr or not mgr.is_kb_connected:
+            return
+        if not self.config.get("memory_consolidation_enabled", True):
+            return
+        # 后台整理启用时禁用旧巩固，避免并发竞态（spec: 旧 consolidation 迁移）
+        if self.config.get("maintenance_enabled", False):
+            return
+        min_age_days = _read_positive_int(
+            self.config.get("consolidation_min_age_days", 14), 14
+        )
+        max_recall = _read_positive_int(
+            self.config.get("consolidation_max_recall", 1), 1
+        )
+        limit = _read_positive_int(self.config.get("consolidation_batch_size", 30), 30)
+        try:
+            candidates = await mgr.fetch_consolidation_candidates(
+                event, min_age_days, max_recall, limit
+            )
+        except Exception as e:
+            logger.debug(f"[简单长期记忆] 读取巩固候选失败: {e}")
+            return
+        if not candidates:
+            return
+        provider_id = await self._get_llm_provider_id(event, "summarization")
+        if not provider_id:
+            provider_id = await self._get_llm_provider_id(event, "extraction")
+        if not provider_id:
+            return
+        joined = "\n".join(
+            f"- {c.get('text', '').strip()}" for c in candidates if c.get("text")
+        )
+        if not joined.strip():
+            return
+        try:
+            prompt = MEMORY_CONSOLIDATION_PROMPT.substitute(memories=joined)
+            llm_response = await self.context.llm_generate(
+                chat_provider_id=provider_id, prompt=prompt
+            )
+            summary = (getattr(llm_response, "completion_text", "") or "").strip()
+        except Exception as e:
+            logger.debug(f"[简单长期记忆] 巩固 LLM 调用失败: {e}")
+            return
+        if not summary:
+            return
+        source_uris = [
+            c.get("metadata", {}).get("uri")
+            for c in candidates
+            if c.get("metadata", {}).get("uri")
+        ]
+        # 先写摘要再标记源（避免 store 失败后源已 deprecated 但无替代）
+        try:
+            await mgr.store_memory(
+                event=event,
+                content=summary,
+                domain="context",
+                memory_type=MemoryType.NORMAL,
+                disclosure="由历史低频记忆巩固而来",
+                importance=4,
+                memory_scope=MemoryScope.PERSONAL,
+            )
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 巩固摘要写入失败，保留原文: {e}")
+            return
+        marked = await mgr.mark_consolidated(source_uris)
+        if marked <= 0:
+            logger.debug("[简单长期记忆] 巩固：原文标记 0 条（摘要已写入）")
+        logger.info(
+            f"[简单长期记忆] 巩固 {len(candidates)} 条 → 1 条摘要，标记原文 {marked} 条"
+        )
+
+    def _cleanup_expired_snapshots(self, current_time: float | None = None) -> None:
+        """清理过期的请求快照"""
+        current_time = current_time or time.time()
+        if current_time - self._last_snapshot_cleanup < self.SNAPSHOT_CLEANUP_INTERVAL:
+            return
+        self._last_snapshot_cleanup = current_time
+
+        expired_keys = [
+            key
+            for key, entry in self._request_snapshots.items()
+            if current_time - entry.get("timestamp", 0) > self.SNAPSHOT_TTL
+        ]
+        for key in expired_keys:
+            del self._request_snapshots[key]
+            self._session_counters.pop(key, None)
+        for key in list(self._session_counters):
+            if key not in self._request_snapshots:
+                self._session_counters.pop(key, None)
+
+    # ==================== JSON 解析辅助 ====================
+
+    def _strip_json_fence(self, text: str) -> str:
+        """移除 markdown JSON 围栏"""
+        return _strip_json_fence_text(text)
+
+    def _parse_extracted_memories(
+        self, text: str, session_type: str = "private"
+    ) -> list[dict[str, Any]]:
+        """解析 LLM 返回的记忆 JSON，带校验和上限"""
+        return _shared_parse_extracted_memories(text, session_type)
+
+    def _build_conversation_from_snapshots(
+        self, snapshots: list[dict[str, Any]]
+    ) -> str:
+        """从快照列表构建对话文本"""
+        lines = []
+        for snapshot in snapshots:
+            prompt = snapshot.get("prompt", "")
+            response = snapshot.get("response", "")
+            sender_id = snapshot.get("sender_id", "")
+            if prompt:
+                sender_label = f"用户:{sender_id}" if sender_id else "用户"
+                lines.append(f"[{sender_label}]: {prompt}")
+            if response:
+                lines.append(f"[助手]: {response}")
+        return "\n".join(lines)
+
+    # ==================== 检索优化 ====================
+
+    async def _optimize_recall_query(
+        self, event: AstrMessageEvent, raw_query: str
+    ) -> str:
+        """调用 LLM 从对话上下文中提炼检索关键词"""
+        provider_id = await self._get_llm_provider_id(event, "extraction")
+        if not provider_id:
+            return raw_query
+
+        prompt = RECALL_QUERY_PROMPT.substitute(context=raw_query[:1000])
+        try:
+            timeout = _clamp_timeout(
+                self.config.get(
+                    "optimize_recall_query_timeout",
+                    DEFAULT_RECALL_QUERY_OPTIMIZATION_TIMEOUT,
+                )
+            )
+            llm_response = await asyncio.wait_for(
+                self.context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=prompt,
+                ),
+                timeout=timeout,
+            )
+            result = getattr(llm_response, "completion_text", "") or ""
+            result = self._strip_json_fence(result).strip()
+            keywords = json.loads(result)
+            if isinstance(keywords, list) and keywords:
+                optimized = " ".join(str(k) for k in keywords[:5])
+                logger.debug(f"[简单长期记忆] 检索优化: {optimized}")
+                return optimized
+        except asyncio.TimeoutError:
+            logger.debug("[简单长期记忆] 检索优化超时，使用原始查询")
+        except Exception as e:
+            logger.debug(f"[简单长期记忆] 检索优化失败，使用原始查询: {e}")
+
+        return raw_query
+
+    # ==================== LLM 钩子 ====================
+
+    @filter.on_llm_request()
+    async def inject_memories(self, event: AstrMessageEvent, request: ProviderRequest):
+        if str(getattr(event, "unified_msg_origin", "")) not in self.config.get("allowed_friend_sessions", []):
+            return
+        if not self.memory_mgr:
+            return
+
+        if not self.config.get("auto_memorize", True):
+            return
+
+        request.system_prompt = (request.system_prompt or "") + (
+            "\n[长期记忆] 用户明确要求记住某件事时，使用 memory_store 保存；"
+            "只有工具明确报告保存成功才说已经记住。工具不可用或失败时如实说明，"
+            "不要把当前对话上下文当成长期记忆。不要保存密码、密钥、联系方式、"
+            "健康及其他敏感个人信息；不确定归属时先询问。用户要求忘记时使用"
+            "记忆管理工具，不要只口头承诺。\n"
+        )
+
+        # P1 生命周期维护（节流；expire 轻量同步，consolidate 含 LLM 调用后台化以免阻塞用户首轮）
+        await self._maybe_expire_stale_memories()
+        task = asyncio.create_task(self._maybe_consolidate_memories(event))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+        try:
+            # 累积请求快照（等待响应后完成）
+            self._accumulate_request_snapshot(event, request)
+
+            # 构建召回查询
+            contexts = _normalize_contexts(request.contexts)
+            deadline = time.monotonic() + recall_timeout(self.config)
+            query = _build_recall_query(
+                request.prompt or "", contexts, query_max_chars(self.config)
+            )
+
+            logger.debug(
+                "[简单长期记忆] 自动注入查询已构建: contexts=%s, query=%s",
+                len(contexts),
+                _debug_content_summary(query, preview_limit=0),
+            )
+
+            # 池空短路：无活跃记忆时跳过查询优化与召回，避免空库白烧 LLM/embedding
+            if not await asyncio.wait_for(
+                self.memory_mgr.has_any_active_memory(),
+                timeout=max(0.001, deadline - time.monotonic()),
+            ):
+                logger.debug("[简单长期记忆] 召回短路: 无活跃记忆, source=auto_inject")
+                return
+
+            # 检索优化：调用 LLM 提炼关键词
+            if self.config.get("optimize_recall_query", False):
+                try:
+                    query = await asyncio.wait_for(
+                        self._optimize_recall_query(event, query),
+                        timeout=min(
+                            recall_timeout(self.config) * 0.4,
+                            max(0.001, deadline - time.monotonic()),
+                        ),
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "[简单长期记忆] 查询优化降级: error_type=%s", type(e).__name__
+                    )
+
+            # 召回相关记忆（注入路径：bump=True 计入 recall_count 反馈）
+            memories = await self.memory_mgr.recall_memories(
+                event=event,
+                query=query,
+                top_k=self.config.get("max_memories_per_inject", 5),
+                bump=True,
+                source="auto_inject",
+                deadline=deadline,
+            )
+
+            if memories:
+                # format_memory_for_injection 已返回含 <user_context_reference> 包装的完整字符串
+                safe_memory_context = format_memory_for_injection(
+                    memories,
+                    timezone_name=self._get_display_timezone(),
+                    viewer_user_id=self._get_viewer_user_id(event),
+                )
+                if safe_memory_context:
+                    inject_target = _inject_memory_context(request, safe_memory_context)
+                    logger.debug(
+                        "[简单长期记忆] 自动注入完成: target=%s, memory_count=%s, "
+                        "context_len=%s, memories=%s",
+                        inject_target,
+                        len(memories),
+                        len(safe_memory_context),
+                        [_debug_memory_summary(memory) for memory in memories],
+                    )
+
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 注入记忆失败: {e}")
+
+    @filter.on_llm_response()
+    async def extract_memories(self, event: AstrMessageEvent, response: LLMResponse):
+        if str(getattr(event, "unified_msg_origin", "")) not in self.config.get("allowed_friend_sessions", []):
+            return
+        if not self.memory_mgr:
+            return
+
+        if not self.config.get("auto_memorize", True):
+            return
+
+        try:
+            extraction_interval = _read_positive_int(
+                self.config.get("extraction_interval", 20), 20
+            )
+            if extraction_interval <= 0:
+                self._discard_session_snapshots(event)
+                return
+
+            # 获取响应文本
+            assistant_output = (
+                getattr(response, "completion_text", "")
+                or getattr(response, "result", "")
+                or ""
+            )
+
+            # 用响应完成快照
+            self._complete_snapshot_with_response(event, assistant_output)
+
+            # 递增会话对话计数器
+            current_count = self._increment_session_counter(event)
+
+            # 检查是否达到提取间隔
+            if current_count % extraction_interval != 0:
+                return
+
+            # 先校验 UMO 再清空快照缓冲，无效 UMO 保留累积对话等下个间隔重试
+            parsed_umo = UMOInfo.parse(event.unified_msg_origin)
+            if not parsed_umo.is_valid:
+                logger.warning("[简单长期记忆] 自动提取跳过: invalid_umo")
+                return
+
+            # 获取累积的快照列表
+            snapshots = self._get_and_clear_session_snapshots(event)
+            if not snapshots:
+                return
+
+            # 构建对话文本（包含所有累积的对话）
+            conversation = self._build_conversation_from_snapshots(snapshots)
+
+            # 检查最小内容长度
+            min_length = self.config.get("extraction_min_content_length", 150)
+            if len(conversation) < min_length:
+                logger.debug(
+                    f"[简单长期记忆] 对话总长度 {len(conversation)} < {min_length}，跳过提取"
+                )
+                return
+
+            if not conversation:
+                return
+
+            # 获取提取模型
+            provider_id = await self._get_llm_provider_id(event, "extraction")
+            if not provider_id:
+                logger.debug("[简单长期记忆] 未配置提取模型，跳过记忆提取")
+                return
+
+            allowed_sender_ids = list(
+                dict.fromkeys(
+                    str(snapshot["sender_id"])
+                    for snapshot in snapshots
+                    if snapshot.get("sender_id")
+                )
+            )
+
+            logger.debug(
+                "[简单长期记忆] 自动提取开始: snapshots=%s, conversation=%s, "
+                "interval=%s, counter=%s, provider_configured=%s",
+                len(snapshots),
+                _debug_content_summary(conversation, preview_limit=0),
+                extraction_interval,
+                current_count,
+                bool(provider_id),
+            )
+            extraction_started_at = time.monotonic()
+            # 调用 LLM 提取记忆
+            prompt = MEMORY_EXTRACTION_PROMPT.substitute(
+                platform_id=parsed_umo.platform_id,
+                session_type=parsed_umo.session_type,
+                session_id=parsed_umo.session_id,
+                sender_id=event.get_sender_id(),
+                known_sender_ids=json.dumps(allowed_sender_ids, ensure_ascii=False),
+                conversation=conversation,
+            )
+            try:
+                llm_response = await self.context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=prompt,
+                )
+                extraction_result = getattr(llm_response, "completion_text", "") or ""
+
+                logger.debug(
+                    "[简单长期记忆] 自动提取 LLM 完成: elapsed_ms=%s, result=%s",
+                    round((time.monotonic() - extraction_started_at) * 1000),
+                    _debug_content_summary(extraction_result, preview_limit=0),
+                )
+
+            except Exception as e:
+                logger.warning(f"[简单长期记忆] LLM 提取调用失败: {e}")
+                return
+
+            # 解析提取结果
+            memories = self._parse_extracted_memories(
+                extraction_result, parsed_umo.session_type
+            )
+            logger.debug(
+                "[简单长期记忆] 自动提取解析完成: parsed=%s",
+                len(memories),
+            )
+            if not memories:
+                return
+
+            # 存储提取的记忆
+            stored_count = 0
+            skipped_empty_count = 0
+            store_failures = 0
+            for mem in memories:
+                memory_domain = mem.get("type", "fact")
+                scope = mem.get("scope", MemoryScope.PERSONAL)
+                content = mem.get("content", "")
+                subject = mem.get("subject", "")
+                subjects = mem.get("subjects", []) or ([subject] if subject else [])
+                if scope == MemoryScope.PERSONAL:
+                    try:
+                        subjects = validate_owner_ids(subjects, allowed_sender_ids)
+                    except ValueError:
+                        logger.warning(
+                            "[简单长期记忆] 自动提取拒绝个人记忆: untrusted_subject"
+                        )
+                        continue
+                else:
+                    subject = _current_speaker_subject(event, scope)
+                entities = mem.get("entities", [])
+                topics = mem.get("topics", [])
+                disclosure = mem.get("disclosure", "")
+                importance = mem.get("importance", 3)
+                owner_sender_ids = subjects if scope == MemoryScope.PERSONAL else []
+
+                if not content:
+                    skipped_empty_count += 1
+                    continue
+
+                domain = normalize_domain(memory_domain)
+
+                try:
+                    uri = await self.memory_mgr.store_memory(
+                        event=event,
+                        content=content,
+                        domain=domain,
+                        memory_type=MemoryType.NORMAL,
+                        disclosure=disclosure,
+                        importance=importance,
+                        memory_scope=scope,
+                        subject=subject,
+                        entities=entities,
+                        topics=topics,
+                        owner_sender_ids=owner_sender_ids,
+                        allowed_sender_ids=allowed_sender_ids,
+                    )
+                    stored_count += 1
+                    logger.debug(
+                        "[简单长期记忆] 自动提取写入完成: uri=%s, domain=%s, "
+                        "scope=%s, content=%s",
+                        uri,
+                        domain,
+                        scope,
+                        _debug_content_summary(content),
+                    )
+                except Exception as e:
+                    store_failures += 1
+                    logger.warning(
+                        "[简单长期记忆] 自动提取写入失败: domain=%s, scope=%s, "
+                        "content=%s, error_type=%s, error=%s",
+                        domain,
+                        scope,
+                        _debug_content_summary(content),
+                        type(e).__name__,
+                        e,
+                    )
+
+            logger.debug(
+                "[简单长期记忆] 自动提取完成: snapshots=%s, parsed=%s, "
+                "stored=%s, skipped_empty=%s, store_failures=%s, elapsed_ms=%s",
+                len(snapshots),
+                len(memories),
+                stored_count,
+                skipped_empty_count,
+                store_failures,
+                round((time.monotonic() - extraction_started_at) * 1000),
+            )
+            logger.info(
+                f"[简单长期记忆] 已从 {len(snapshots)} 轮对话中存储 {stored_count} 条记忆（候选 {len(memories)} 条）"
+            )
+
+        except Exception as e:
+            logger.warning(f"[简单长期记忆] 提取记忆失败: {e}")
+
+    # ==================== 用户命令 ====================
+
+    @filter.command_group("memory")
+    def memory_group(self):
+        """记忆管理指令组"""
+        pass
+
+    @memory_group.command("list")
+    async def cmd_list(self, event: AstrMessageEvent):
+        """列出记忆 /memory list [--all] [页码]"""
+        if str(getattr(event, "unified_msg_origin", "")) not in self.config.get("allowed_friend_sessions", []):
+            return
+        if err := _ensure_initialized(self.memory_mgr):
+            yield event.plain_result(err)
+            return
+        args = _parse_memory_flags(_parse_command_args(event, "memory list"))
+        if err := _validate_command(event, args, cmd_name="list", allow_all=True):
+            yield event.plain_result(err)
+            return
+        all_users = args["all"]
+        # 解析页码
+        page = 1
+        positional = args["positional"]
+        if positional:
+            try:
+                page = int(positional)
+            except ValueError:
+                yield event.plain_result("页码必须是正整数")
+                return
+            if page < 1:
+                yield event.plain_result("页码必须是正整数")
+                return
+        page_size = 10
+        memories, total, truncated = await self.memory_mgr.list_memories(
+            event, page=page, page_size=page_size, all_users=all_users
+        )
+        scope = "全局" if all_users else "个人"
+        result = format_memory_for_user(
+            memories,
+            page=page,
+            total=total,
+            page_size=page_size,
+            all_mode=all_users,
+            cmd_prefix=self._get_cmd_prefix(),
+        )
+        if truncated:
+            result += (
+                "\n\n提示: 群聊可见记忆较多，当前总数受扫描上限影响，可能还有更多记录。"
+            )
+        yield event.plain_result(f"[{scope}记忆]\n{result}")
+
+    @memory_group.command("search")
+    async def cmd_search(self, event: AstrMessageEvent):
+        """搜索记忆 /memory search [--all] <关键词>"""
+        if str(getattr(event, "unified_msg_origin", "")) not in self.config.get("allowed_friend_sessions", []):
+            return
+        if err := _ensure_initialized(self.memory_mgr):
+            yield event.plain_result(err)
+            return
+        args = _parse_memory_flags(_parse_command_args(event, "memory search"))
+        if err := _validate_command(event, args, cmd_name="search", allow_all=True):
+            yield event.plain_result(err)
+            return
+        all_users = args["all"]
+        query = args["positional"]
+        if not query:
+            yield event.plain_result("请提供搜索关键词")
+            return
+        memories = await self.memory_mgr.recall_memories(
+            event, query, all_users=all_users, source="command_search"
+        )
+        scope = "全局" if all_users else "个人"
+        result = format_memory_for_user(
+            memories,
+            total=len(memories),
+            page_size=max(1, len(memories)),
+            cmd_prefix=self._get_cmd_prefix(),
+        )
+        yield event.plain_result(f"[{scope}搜索]\n{result}")
+
+    @memory_group.command("stats")
+    async def cmd_stats(self, event: AstrMessageEvent):
+        """查看记忆统计 /memory stats [--all]"""
+        if str(getattr(event, "unified_msg_origin", "")) not in self.config.get("allowed_friend_sessions", []):
+            return
+        if err := _ensure_initialized(self.memory_mgr):
+            yield event.plain_result(err)
+            return
+        args = _parse_memory_flags(_parse_command_args(event, "memory stats"))
+        if err := _validate_command(
+            event, args, cmd_name="stats", allow_all=True, allow_positional=False
+        ):
+            yield event.plain_result(err)
+            return
+        all_users = args["all"]
+        stats = await self.memory_mgr.get_memory_stats(event, all_users=all_users)
+        scope = "全局" if all_users else "个人"
+        result = (
+            f"[{scope}记忆统计]\n"
+            f"  总数: {stats['total']}\n"
+            f"  永久记忆: {stats['permanent']}\n"
+            f"  普通记忆: {stats['normal']}\n"
+            f"  历史已压缩: {stats['compressed']}"
+        )
+        yield event.plain_result(result)
+
+    @memory_group.command("test")
+    async def cmd_test(self, event: AstrMessageEvent):
+        """测试读写或后台整理阶段（管理员）。"""
+        if str(getattr(event, "unified_msg_origin", "")) not in self.config.get("allowed_friend_sessions", []):
+            return
+        if err := _ensure_initialized(self.memory_mgr):
+            yield event.plain_result(err)
+            return
+        if not event.is_admin():
+            yield event.plain_result("该操作需要管理员权限")
+            return
+
+        args_text = _parse_command_args(event, "memory test")
+        try:
+            args = shlex.split(args_text)
+        except ValueError as e:
+            yield event.plain_result(f"参数解析失败: {e}")
+            return
+        if len(args) > 1:
+            yield event.plain_result(
+                "用法: /memory test [purge|extract|organizer|analyst|reviewer|cycle]"
+            )
+            return
+        stage = args[0].lower() if args else "storage"
+        if stage in {"help", "--help", "-h"}:
+            yield event.plain_result(
+                "用法: /memory test [purge|extract|organizer|analyst|reviewer|cycle]\n"
+                "不带参数测试记忆读写；后台阶段固定 dry-run，不写入记忆或待审队列。"
+            )
+            return
+        if stage in {"storage", "memory"}:
+            yield event.plain_result(await self._run_memory_test(event))
+            return
+        if stage not in {
+            "purge",
+            "extract",
+            "organizer",
+            "analyst",
+            "reviewer",
+            "cycle",
+        }:
+            yield event.plain_result(
+                "未知测试项。合法值: purge, extract, organizer, analyst, reviewer, cycle"
+            )
+            return
+        yield event.plain_result(await self._run_maintenance_test(stage))
+
+    @memory_group.command("forget")
+    async def cmd_forget(self, event: AstrMessageEvent):
+        """删除记忆 /memory forget <uri> [--user <id>]"""
+        if str(getattr(event, "unified_msg_origin", "")) not in self.config.get("allowed_friend_sessions", []):
+            return
+        if err := _ensure_initialized(self.memory_mgr):
+            yield event.plain_result(err)
+            return
+        args = _parse_memory_flags(_parse_command_args(event, "memory forget"))
+        if err := _validate_command(event, args, cmd_name="forget", allow_user=True):
+            yield event.plain_result(err)
+            return
+        target_user_id = args["user"]
+        uri = args["positional"]
+        if not uri:
+            yield event.plain_result("请提供要删除的记忆 URI")
+            return
+
+        is_admin = event.is_admin()
+
+        if target_user_id and not is_admin:
+            yield event.plain_result("--user 参数仅管理员可用")
+            return
+
+        if target_user_id:
+            # 管理员删除指定用户的记忆
+            deleted = await self.memory_mgr.forget_memory_by_user(
+                event, uri, target_user_id
+            )
+            if deleted == 0:
+                yield event.plain_result(f"未找到用户 {target_user_id} 的记忆: {uri}")
+            else:
+                yield event.plain_result(
+                    f"已删除用户 {target_user_id} 的 {deleted} 条记忆: {uri}"
+                )
+        elif is_admin:
+            # 管理员按 URI 删除所有用户
+            deleted = await self.memory_mgr.forget_memory_by_uri(uri)
+            if deleted == 0:
+                yield event.plain_result(f"未找到匹配的记忆: {uri}")
+            else:
+                yield event.plain_result(f"已删除 {deleted} 条记忆: {uri}")
+        else:
+            # 普通用户只能删自己的
+            deleted = await self.memory_mgr.forget_memory(event, uri)
+            if deleted > 0:
+                yield event.plain_result(f"已删除记忆: {uri}")
+            else:
+                yield event.plain_result(f"未找到或无权限删除记忆: {uri}")
+
+    @memory_group.command("clear")
+    async def cmd_clear(self, event: AstrMessageEvent):
+        """清空记忆（管理员）/memory clear [--all] [--user <id>]"""
+        if str(getattr(event, "unified_msg_origin", "")) not in self.config.get("allowed_friend_sessions", []):
+            return
+        if err := _ensure_initialized(self.memory_mgr):
+            yield event.plain_result(err)
+            return
+        args = _parse_memory_flags(_parse_command_args(event, "memory clear"))
+        if err := _validate_command(
+            event,
+            args,
+            cmd_name="clear",
+            require_admin=True,
+            allow_all=True,
+            allow_user=True,
+            allow_confirm=True,
+            allow_positional=False,
+        ):
+            yield event.plain_result(err)
+            return
+        if args["all"] and args["user"]:
+            yield event.plain_result("--all 与 --user 不可同时使用")
+            return
+        if args["all"]:
+            target_label = "all"
+        elif args["user"]:
+            target_label = f"user:{args['user']}"
+        else:
+            target_label = f"current:{event.get_sender_id()}"
+        confirm_code = _confirmation_code("clear", target_label)
+        cmd_prefix = _render_cmd_prefix(self._get_cmd_prefix())
+        if args["confirm"] != confirm_code:
+            if args["all"]:
+                preview = await self.memory_mgr.count_clear_memories(
+                    event, all_users=True
+                )
+                scope = "全部记忆"
+            elif args["user"]:
+                preview = await self.memory_mgr.count_clear_memories_by_user(
+                    event, args["user"]
+                )
+                scope = f"用户 {args['user']} 的记忆"
+            else:
+                preview = await self.memory_mgr.count_clear_memories(event)
+                scope = "当前用户记忆"
+            yield event.plain_result(
+                "[清空确认]\n"
+                f"  范围: {scope}\n"
+                f"  预计影响: {preview} 条\n"
+                f"  确认执行: {cmd_prefix}memory clear --confirm {confirm_code}"
+                + (" --all" if args["all"] else "")
+                + (f" --user {args['user']}" if args["user"] else "")
+            )
+            return
+        if args["all"]:
+            count = await self.memory_mgr.clear_memories(event, all_users=True)
+            yield event.plain_result(f"已清空全部 {count} 条记忆")
+        elif args["user"]:
+            target_user_id = args["user"]
+            count = await self.memory_mgr.clear_memories_by_user(event, target_user_id)
+            yield event.plain_result(f"已清空用户 {target_user_id} 的 {count} 条记忆")
+        else:
+            count = await self.memory_mgr.clear_memories(event)
+            yield event.plain_result(f"已清空 {count} 条记忆")
+
+    @memory_group.command("rebuild")
+    async def cmd_rebuild(self, event: AstrMessageEvent):
+        """重建或迁移记忆（管理员）/memory rebuild [--to <知识库名>] [--clear-cache]"""
+        if str(getattr(event, "unified_msg_origin", "")) not in self.config.get("allowed_friend_sessions", []):
+            return
+        if err := _ensure_initialized(self.memory_mgr):
+            yield event.plain_result(err)
+            return
+        args = _parse_memory_flags(_parse_command_args(event, "memory rebuild"))
+        if err := _validate_command(
+            event,
+            args,
+            cmd_name="rebuild",
+            require_admin=True,
+            allow_to=True,
+            allow_clear_cache=True,
+            allow_confirm=True,
+            allow_positional=False,
+        ):
+            yield event.plain_result(err)
+            return
+
+        # --clear-cache: 清理重建缓存
+        if args["clear_cache"]:
+            if args["to"]:
+                yield event.plain_result("--clear-cache 不能与 --to 同时使用")
+                return
+            cache_status = await self.memory_mgr.get_rebuild_cache_status()
+            if (
+                self.memory_mgr.is_rebuilding
+                or cache_status.get("status") == "in_progress"
+            ):
+                yield event.plain_result("重建/迁移正在进行中，不能清理缓存")
+                return
+            cache_fingerprint = self.memory_mgr.rebuild_cache_fingerprint(cache_status)
+            confirm_code = _confirmation_code("clear-cache", cache_fingerprint)
+            cmd_prefix = _render_cmd_prefix(self._get_cmd_prefix())
+            if args["confirm"] != confirm_code:
+                yield event.plain_result(
+                    "[清理重建缓存确认]\n"
+                    f"  缓存记录数: {cache_status.get('memory_records', 0)}\n"
+                    f"  缓冲写入数: {cache_status.get('pending_writes', 0)}\n"
+                    f"  上次状态: {cache_status.get('status', '无')}\n"
+                    f"  源知识库: {cache_status.get('source_kb', '无')}\n"
+                    f"  目标知识库: {cache_status.get('target_kb', '无')}\n"
+                    f"  确认执行: {cmd_prefix}memory rebuild --clear-cache --confirm {confirm_code}"
+                )
+                return
+            current_status = await self.memory_mgr.get_rebuild_cache_status()
+            if (
+                self.memory_mgr.rebuild_cache_fingerprint(current_status)
+                != cache_fingerprint
+            ):
+                yield event.plain_result("重建缓存状态已变化，请重新预览确认")
+                return
+            result = await self.memory_mgr.clear_rebuild_cache()
+            report = "[清理重建缓存]\n"
+            report += f"  缓存记录数: {cache_status.get('memory_records', 0)}\n"
+            report += f"  缓冲写入数: {cache_status.get('pending_writes', 0)}\n"
+            report += f"  上次状态: {cache_status.get('status', '无')}\n"
+            report += f"  源知识库: {cache_status.get('source_kb', '无')}\n"
+            report += f"  目标知识库: {cache_status.get('target_kb', '无')}\n"
+            report += "  清理结果:\n"
+            for key, ok in result.items():
+                report += f"    {key}: {'成功' if ok else '失败'}\n"
+            yield event.plain_result(report)
+            return
+
+        target_kb_name = args["to"] or None
+        logger.debug(
+            "[简单长期记忆] rebuild 命令开始: target_kb=%s, clear_cache=%s, "
+            "confirm_provided=%s, current_kb=%s",
+            target_kb_name or "(current)",
+            args["clear_cache"],
+            bool(args["confirm"]),
+            self.memory_mgr.current_kb_name,
+        )
+
+        # --to 与当前 KB 同名时视为原地重建
+        if target_kb_name and self.memory_mgr.current_kb_name == target_kb_name:
+            target_kb_name = None
+
+        action_target = target_kb_name or self.memory_mgr.current_kb_name
+        source_kb_id = await self.memory_mgr.get_kb_id_by_name(
+            self.memory_mgr.current_kb_name
+        )
+        target_kb_id = (
+            await self.memory_mgr.get_kb_id_by_name(target_kb_name)
+            if target_kb_name
+            else source_kb_id
+        )
+        action_fingerprint = f"{action_target}:{source_kb_id}:{target_kb_id}"
+        confirm_code = _confirmation_code("rebuild", action_fingerprint)
+        cmd_prefix = _render_cmd_prefix(self._get_cmd_prefix())
+        if args["confirm"] != confirm_code:
+            source_count = await self.memory_mgr.count_kb_memory_records_by_name(
+                self.memory_mgr.current_kb_name
+            )
+            target_count = (
+                await self.memory_mgr.count_kb_memory_records_by_name(target_kb_name)
+                if target_kb_name
+                else source_count
+            )
+            target_missing = target_kb_name is not None and not target_kb_id
+            mode = "迁移" if target_kb_name else "重建"
+            report = (
+                f"[{mode}确认]\n"
+                f"  当前知识库: {self.memory_mgr.current_kb_name}\n"
+                f"  目标知识库: {target_kb_name or self.memory_mgr.current_kb_name}\n"
+                f"  当前记忆数: {source_count}\n"
+            )
+            if target_kb_name:
+                if target_missing:
+                    report += "  目标知识库不存在，请检查名称\n"
+                    yield event.plain_result(report)
+                    return
+                report += f"  目标已有记忆数: {target_count}\n"
+                if target_count > 0:
+                    report += "  目标知识库已有记忆，执行前需要先清空或更换目标\n"
+            report += (
+                f"  确认执行: {cmd_prefix}memory rebuild --confirm {confirm_code}"
+                + (f" --to {shlex.quote(target_kb_name)}" if target_kb_name else "")
+            )
+            yield event.plain_result(report)
+            logger.debug(
+                "[简单长期记忆] rebuild 确认预览: mode=%s, source_count=%s, "
+                "target_count=%s, target_missing=%s, confirm_code_generated=%s",
+                mode,
+                source_count,
+                target_count,
+                target_missing,
+                True,
+            )
+            return
+        if not source_kb_id:
+            yield event.plain_result("当前知识库不存在，请检查配置")
+            return
+        if target_kb_name and not target_kb_id:
+            yield event.plain_result("目标知识库不存在，请重新预览确认")
+            return
+
+        if target_kb_name:
+            yield event.plain_result(
+                f"正在迁移记忆到知识库 '{target_kb_name}'，请稍候..."
+            )
+        else:
+            yield event.plain_result("正在当前知识库重建所有记忆，请稍候...")
+
+        logger.debug(
+            "[简单长期记忆] rebuild 执行确认: mode=%s, source_kb=%s, target_kb=%s, "
+            "source_id=%s, target_id=%s",
+            "migration" if target_kb_name else "rebuild",
+            self.memory_mgr.current_kb_name,
+            target_kb_name or self.memory_mgr.current_kb_name,
+            source_kb_id,
+            target_kb_id,
+        )
+        try:
+            result = await self.memory_mgr.rebuild_memories(
+                target_kb_name=target_kb_name,
+            )
+            logger.debug(
+                "[简单长期记忆] rebuild 执行返回: status=%s, total=%s, success=%s, "
+                "failed=%s, pending_flushed=%s, verification=%s",
+                result.get("status"),
+                result.get("total"),
+                result.get("success"),
+                result.get("failed"),
+                result.get("pending_flushed"),
+                result.get("verification", {}).get("passed"),
+            )
+            status = result.get("status", "completed")
+            is_interrupted = status == "interrupted"
+
+            if is_interrupted:
+                # 失败路径：明确告知异常终止
+                mode = "迁移" if result["is_migration"] else "重建"
+                error_msg = result.get("error", "未知错误")
+                if result["is_migration"] and result.get("success", 0) > 0:
+                    error_msg += (
+                        "；目标知识库可能已有已写入副本，源知识库未确认清理完成"
+                    )
+                report = (
+                    f"[{mode}异常终止]\n"
+                    f"  原因: {error_msg}\n"
+                    f"  已处理: {result['success']} 条\n"
+                    f"  缓冲写入: {result.get('pending_flushed', 0)} 条"
+                )
+                report += (
+                    "\n\n  重建缓存已保留，请排查问题后重试。"
+                    "\n  确认无需恢复后可执行:"
+                    f"\n  {cmd_prefix}memory rebuild --clear-cache"
+                )
+                yield event.plain_result(report)
+                return
+
+            mode = "迁移" if result["is_migration"] else "重建"
+            report = (
+                f"[{mode}完成]\n"
+                f"  目标知识库: {result['target_kb']}\n"
+                f"  总计: {result['total']}\n"
+                f"  成功: {result['success']}\n"
+                f"  失败: {result['failed']}"
+            )
+            if result["pending_flushed"]:
+                report += f"\n  缓冲写入: {result['pending_flushed']} 条"
+
+            # 完整性校验结果
+            v = result.get("verification", {})
+            if v:
+                report += "\n\n[完整性校验]"
+                if v.get("error"):
+                    report += f"\n  校验异常: {v['error']}"
+                elif v["passed"]:
+                    report += (
+                        f"\n  状态: 通过"
+                        f"\n  预期: {v['expected']} 条, "
+                        f"实际: {v['actual']} 条"
+                    )
+                else:
+                    report += (
+                        f"\n  状态: 不一致"
+                        f"\n  预期: {v['expected']} 条, "
+                        f"实际: {v['actual']} 条, "
+                        f"差异: {v['diff']:+d} 条"
+                    )
+
+            # 迁移提示：仅当实际提交成功时显示切换信息
+            if result["is_migration"]:
+                committed = result.get("migration_committed", False)
+                if committed:
+                    report += f"\n\n  插件已切换到知识库: {result['target_kb']}"
+                    report += (
+                        "\n  注意: 请同步更新插件配置中的知识库选项，"
+                        "否则重启后将回退到旧知识库"
+                    )
+                else:
+                    report += "\n\n  迁移未完成（存在失败），插件仍使用原知识库"
+
+            if v and v.get("passed"):
+                report += (
+                    "\n\n  数据校验通过，请确认记忆无误后执行:"
+                    f"\n  {cmd_prefix}memory rebuild --clear-cache"
+                )
+            elif v and not v.get("passed") and not v.get("error"):
+                report += (
+                    "\n\n  数据校验未通过，请排查后重试。"
+                    "重建缓存已保留，可执行:"
+                    f"\n  {cmd_prefix}memory rebuild --clear-cache 清理缓存"
+                )
+
+            yield event.plain_result(report)
+        except ValueError as e:
+            logger.debug(
+                "[简单长期记忆] rebuild 命令 ValueError: error=%s",
+                e,
+            )
+            yield event.plain_result(str(e))
+        except Exception as e:
+            logger.exception("[简单长期记忆] rebuild 命令异常")
+            yield event.plain_result(f"重建失败: {e}")
+
+    @memory_group.command("review")
+    async def cmd_review(self, event: AstrMessageEvent):
+        """争议审查 /memory review [approve|reject|clear] [id]"""
+        if str(getattr(event, "unified_msg_origin", "")) not in self.config.get("allowed_friend_sessions", []):
+            return
+        if not event.is_admin():
+            yield event.plain_result("仅管理员可用")
+            return
+        args = _parse_command_args(event, "memory review").strip().split()
+        action = args[0] if args else "list"
+
+        if action == "list":
+            queue = await self.get_kv_data("maintenance_pending_review", None) or []
+            pending = [q for q in queue if q.get("status") == "pending"]
+            if not pending:
+                yield event.plain_result("✅ 无待审争议项")
+                return
+            lines = [f"📝 待审争议 ({len(pending)} 条)："]
+            for item in pending:
+                lines.append(
+                    f"#{item['id']} [{item.get('op_type', '?')}] "
+                    f"{item.get('verdict_reason', '')} "
+                    f"({item.get('created_at', '')})"
+                )
+            lines.append("\n/memory review approve <id> 批准")
+            lines.append("/memory review reject <id> 废案")
+            lines.append("/memory review clear 清空")
+            yield event.plain_result("\n".join(lines))
+
+        elif action == "clear":
+            await self.put_kv_data("maintenance_pending_review", [])
+            yield event.plain_result("✅ 待审队列已清空")
+
+        elif action in ("approve", "reject"):
+            if len(args) < 2:
+                yield event.plain_result(f"用法: /memory review {action} <id>")
+                return
+            try:
+                target_id = int(args[1])
+            except ValueError:
+                yield event.plain_result("id 必须是数字")
+                return
+            queue = await self.get_kv_data("maintenance_pending_review", None) or []
+            found = None
+            for item in queue:
+                if item.get("id") == target_id and item.get("status") == "pending":
+                    found = item
+                    break
+            if not found:
+                yield event.plain_result(f"未找到待审项 #{target_id}")
+                return
+            if action == "reject":
+                found["status"] = "rejected"
+                await self.put_kv_data("maintenance_pending_review", queue)
+                yield event.plain_result(f"🚫 #{target_id} 已废案")
+            elif action == "approve":
+                # 先执行，成功后才标记 approved（失败保留可重试）
+                # execute_approved 与后台周期阶段 4 互斥，避免并发写竞态
+                runner = self._scheduler.runner if self._scheduler else None
+                if not runner:
+                    yield event.plain_result(f"⚠️ #{target_id} 调度器未运行，无法执行")
+                    return
+                try:
+                    ok = await runner.execute_approved(found.get("op", {}))
+                    if ok:
+                        found["status"] = "approved"
+                        await self.put_kv_data("maintenance_pending_review", queue)
+                        yield event.plain_result(f"✅ #{target_id} 已批准并执行")
+                    else:
+                        found["status"] = "failed"
+                        await self.put_kv_data("maintenance_pending_review", queue)
+                        yield event.plain_result(
+                            f"⚠️ #{target_id} 执行失败，已标记 failed"
+                        )
+                except Exception as e:
+                    yield event.plain_result(f"⚠️ #{target_id} 执行异常: {e}")
+        else:
+            yield event.plain_result(
+                "用法: /memory review [list|approve <id>|reject <id>|clear]"
+            )
+
+    async def _run_memory_test(self, event: AstrMessageEvent) -> str:
+        """执行一次记忆写入-读取测试并返回报告"""
+        test_content = "memory_test_probe_这是一条测试记忆"
+        test_domain = "facts"
+        uri = str(MemoryURI.generate(test_domain))
+        report = ["[记忆读写测试]"]
+
+        # 写入测试
+        try:
+            await self.memory_mgr.store_memory(
+                event=event,
+                content=test_content,
+                domain=test_domain,
+                uri=uri,
+                memory_type=MemoryType.NORMAL,
+                disclosure="测试",
+                importance=1,
+            )
+            report.append(f"  写入: 成功 (URI: {uri})")
+        except Exception as e:
+            report.append(f"  写入: 失败 ({e})")
+            return "\n".join(report)
+
+        # 读取测试
+        hit = False
+        try:
+            results = await self.memory_mgr.recall_memories(
+                event=event,
+                query=test_content,
+                top_k=3,
+                source="command_test",
+            )
+            hit = any("memory_test_probe" in r.get("text", "") for r in results)
+            report.append(
+                f"  召回: {'命中' if hit else '未命中'} (返回 {len(results)} 条)"
+            )
+        except Exception as e:
+            report.append(f"  召回: 失败 ({e})")
+
+        # 清理测试数据
+        try:
+            deleted = await self.memory_mgr.forget_memory(event=event, uri=uri)
+            report.append(
+                "  清理: 已删除测试记忆" if deleted > 0 else "  清理: 未找到测试记忆"
+            )
+        except Exception as e:
+            report.append(f"  清理: 失败 ({e})")
+
+        report.append(
+            "  结论: " + ("全部通过" if hit else "召回异常，请检查 embedding 配置")
+        )
+        return "\n".join(report)
+
+    async def _run_maintenance_test(self, stage: str) -> str:
+        """运行后台阶段 dry-run，并只返回计数摘要。"""
+        scheduler = self._scheduler
+        if scheduler is None:
+            scheduler = MaintenanceScheduler(
+                context=self.context,
+                memory_mgr=self.memory_mgr,
+                config=self.config,
+                kv_put=self.put_kv_data,
+                kv_get=self.get_kv_data,
+            )
+        try:
+            result = await scheduler.runner.run_test_stage(stage)
+        except Exception as e:
+            logger.exception("[简单长期记忆] 后台测试失败: stage=%s", stage)
+            return f"[后台整理测试: {stage}]\n  结果: 失败 ({e})\n  模式: dry-run，无持久化写入"
+
+        report = [f"[后台整理测试: {stage}]", "  模式: dry-run（不执行持久化写入）"]
+        purge = result.get("purge")
+        if isinstance(purge, dict):
+            report.append(
+                "  purge: 候选 {candidates}，实际清理 {purged}，失败 {failed}".format(
+                    candidates=purge.get("candidates", 0),
+                    purged=purge.get("purged", 0),
+                    failed=purge.get("failed", 0),
+                )
+            )
+        extract = result.get("extract")
+        if isinstance(extract, dict):
+            metrics = extract.get("metrics") or {}
+            seg = metrics.get("segmenter") or {}
+            report.append(
+                "  extract: 解析 {parsed}，扫描会话 {convs}，产出块 {blocks}，"
+                "新增 {created}，更新 {updated}".format(
+                    parsed="成功" if extract.get("parsed") else "失败",
+                    convs=seg.get("conversations_scanned", 0),
+                    blocks=metrics.get("blocks", 0),
+                    created=metrics.get("created", 0),
+                    updated=metrics.get("updated", 0),
+                )
+            )
+        for name in ("organizer", "analyst"):
+            manifest = result.get(name)
+            if isinstance(manifest, dict):
+                metrics = manifest.get("metrics") or {}
+                report.append(
+                    "  {name}: 解析 {parsed}，操作 {operations}，记忆 {memories}，"
+                    "向量 {vectors}，缺失 {missing}，候选 {candidates}".format(
+                        name=name,
+                        parsed="成功" if manifest.get("parsed") else "失败",
+                        operations=manifest.get(
+                            "operations", manifest.get("ops_count", 0)
+                        ),
+                        memories=metrics.get("memory_count", 0),
+                        vectors=metrics.get("vector_count", 0),
+                        missing=metrics.get("vector_missing", 0),
+                        candidates=metrics.get("candidates_screened", 0),
+                    )
+                )
+        reviewer = result.get("reviewer")
+        if isinstance(reviewer, dict):
+            report.append(
+                "  reviewer: 裁决 {verdicts}，通过 {approved}，拒绝 {rejected}".format(
+                    verdicts=reviewer.get(
+                        "verdicts", result.get("reviewer_verdicts_count", 0)
+                    ),
+                    approved=reviewer.get("approved", 0),
+                    rejected=reviewer.get("rejected", 0),
+                )
+            )
+        elif "reviewer_verdicts_count" in result:
+            report.append(f"  reviewer: 裁决 {result['reviewer_verdicts_count']}")
+        llm_stats = result.get("llm_stats") or {}
+        report.append(
+            "  LLM: 调用 {calls}，缓存命中 {cache_hits}，错误 {errors}".format(
+                calls=llm_stats.get("calls", 0),
+                cache_hits=llm_stats.get("cache_hits", 0),
+                errors=llm_stats.get("errors", 0),
+            )
+        )
+        errors = result.get("errors") or []
+        conclusion = (
+            "完成（无阶段错误）" if not errors else f"完成（{len(errors)} 项阶段错误）"
+        )
+        report.append(f"  结论: {conclusion}")
+        return "\n".join(report)
+
+    # ==================== LLM 工具 ====================
+
+    @filter.llm_tool(name="memory_recall")
+    async def tool_recall(
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        domain: str = "",
+        scope: str = "",
+    ) -> str:
+        """Search long-term memory for relevant information
+
+        Args:
+            query(string): search keywords or question
+            domain(string): optional filter by memory domain (user_profile/preferences/facts/events/context)
+            scope(string): optional filter by memory scope (personal/group/conversation/global)
+        """
+        if str(getattr(event, "unified_msg_origin", "")) not in self.config.get("allowed_friend_sessions", []):
+            return "Memory unavailable for this session"
+        if not self.memory_mgr:
+            return "Memory plugin not initialized"
+
+        # 参数校验：错误即报错，不静默降级
+        domain_filter: str | None = None
+        if domain:
+            domain_lower = domain.lower().strip()
+            if domain_lower not in VALID_TOOL_DOMAINS:
+                valid = ", ".join(sorted(VALID_TOOL_DOMAINS))
+                return f"Error: invalid domain '{domain}'. Valid domains: {valid}"
+            domain_filter = domain_lower
+
+        scope_filter: str | None = None
+        if scope:
+            scope_lower = scope.lower().strip()
+            if scope_lower not in (*VALID_TOOL_SCOPES, MemoryScope.GLOBAL):
+                valid = ", ".join(sorted((*VALID_TOOL_SCOPES, MemoryScope.GLOBAL)))
+                return f"Error: invalid scope '{scope}'. Valid scopes: {valid}"
+            scope_filter = scope_lower
+
+        memories = await self.memory_mgr.recall_memories(
+            event,
+            query,
+            domain=domain_filter,
+            memory_scope=scope_filter,
+            source="tool_recall",
+        )
+        if not memories:
+            return "No relevant memories found"
+
+        result = format_memory_for_injection(
+            memories,
+            timezone_name=self._get_display_timezone(),
+            viewer_user_id=self._get_viewer_user_id(event),
+        )
+        return f"<user_history_info>\n{result}\n</user_history_info>"
+
+    @filter.llm_tool(name="memory_store")
+    async def tool_store(
+        self,
+        event: AstrMessageEvent,
+        content: str,
+        memory_type: str = "fact",
+        disclosure: str = "",
+        importance: int = 3,
+        scope: str = "personal",
+    ) -> str:
+        """Store information to long-term memory
+
+        Args:
+            content(string): content to remember
+            memory_type(string): memory type (fact/preference/event/context)
+            disclosure(string): condition description for triggering recall
+            importance(int): importance level 1-5, where 5 is most important
+            scope(string): memory scope (personal/group/conversation)
+        """
+        if str(getattr(event, "unified_msg_origin", "")) not in self.config.get("allowed_friend_sessions", []):
+            return "Memory unavailable for this session"
+        if not self.memory_mgr:
+            return "Memory plugin not initialized"
+
+        # 参数校验：错误即报错，不静默降级
+        mem_type_lower = memory_type.lower().strip()
+        if mem_type_lower not in ALLOWED_MEMORY_TYPES:
+            valid = ", ".join(sorted(ALLOWED_MEMORY_TYPES))
+            return f"Error: invalid memory_type '{memory_type}'. Valid types: {valid}"
+
+        scope_lower = scope.lower().strip()
+        if scope_lower == MemoryScope.GLOBAL:
+            return (
+                "Error: scope 'global' is not allowed here. "
+                "Use the memory_store_global tool instead."
+            )
+        if scope_lower not in VALID_TOOL_SCOPES:
+            valid = ", ".join(sorted(VALID_TOOL_SCOPES))
+            return f"Error: invalid scope '{scope}'. Valid scopes: {valid}"
+
+        try:
+            importance_val = int(importance)
+        except (TypeError, ValueError):
+            return f"Error: importance must be an integer between 1 and 5, got '{importance}'"
+        if importance_val < 1 or importance_val > 5:
+            return f"Error: importance must be between 1 and 5, got {importance_val}"
+
+        # group scope 必须在群聊中使用
+        if scope_lower == MemoryScope.GROUP:
+            parsed_umo = UMOInfo.parse(event.unified_msg_origin)
+            if parsed_umo.session_type != "group":
+                return "Error: scope 'group' can only be used in group chats"
+
+        content = _sanitize_memory_content(content)
+        if not content:
+            return "Invalid memory content"
+
+        domain = normalize_domain(mem_type_lower)
+        uri = str(MemoryURI.generate(domain))
+
+        await self.memory_mgr.store_memory(
+            event=event,
+            content=content,
+            domain=domain,
+            uri=uri,
+            memory_type=MemoryType.NORMAL,
+            disclosure=_sanitize_memory_content(disclosure)[:200] if disclosure else "",
+            importance=importance_val,
+            memory_scope=scope_lower,
+        )
+        return f"Memory stored: {uri}"
+
+    @filter.llm_tool(name="memory_update")
+    async def tool_update(
+        self,
+        event: AstrMessageEvent,
+        uri: str,
+        content: str,
+        disclosure: str = "",
+    ) -> str:
+        """Update an existing memory by URI, preserving its domain, importance and scope
+
+        Args:
+            uri(string): URI of the memory to update
+            content(string): new content to replace the old memory
+            disclosure(string): optional new condition description for triggering recall
+        """
+        if str(getattr(event, "unified_msg_origin", "")) not in self.config.get("allowed_friend_sessions", []):
+            return "Memory unavailable for this session"
+        if not self.memory_mgr:
+            return "Memory plugin not initialized"
+
+        if not uri or not uri.strip():
+            return "Error: uri is required"
+
+        # 查找旧记忆（按 user_id 隔离，找不到或不属于自己都报错）
+        old_memory = await self.memory_mgr.get_memory_by_uri(event, uri.strip())
+        if not old_memory:
+            return f"Error: memory not found or not yours: {uri}"
+
+        old_meta = old_memory.get("metadata", {})
+
+        # global 记忆不允许通过此工具修改，必须走管理员确认路径
+        if old_meta.get("memory_scope") == MemoryScope.GLOBAL:
+            return (
+                "Error: global memories cannot be updated via this tool. "
+                "Use /memory commands with admin confirmation instead."
+            )
+
+        content = _sanitize_memory_content(content)
+        if not content:
+            return "Invalid memory content"
+
+        # 使用 replace_memory 保留完整原始 metadata（租户/作用域/归属/关联）
+        new_disclosure = (
+            _sanitize_memory_content(disclosure)[:200] if disclosure else None
+        )
+        try:
+            new_uri = await self.memory_mgr.replace_memory(
+                old_metadata=old_meta,
+                new_content=content,
+                new_disclosure=new_disclosure,
+                updated_by="user",
+            )
+        except Exception as e:
+            return f"Error: failed to update memory: {e}"
+
+        return f"Memory updated: {uri} -> {new_uri}"
+
+    @filter.llm_tool(name="memory_store_global")
+    async def tool_store_global(
+        self,
+        event: AstrMessageEvent,
+        content: str,
+        memory_type: str = "fact",
+        disclosure: str = "",
+    ) -> str:
+        """Store a global long-term memory visible to all chats.
+
+        Only use this when the current user is an admin and explicitly asks to
+        add a global memory, global rule, shared fact, or bot-wide preference.
+
+        Args:
+            content(string): global content to remember for all users/chats
+            memory_type(string): memory type (fact/preference/event/context)
+            disclosure(string): condition description for triggering recall
+        """
+        if str(getattr(event, "unified_msg_origin", "")) not in self.config.get("allowed_friend_sessions", []):
+            return "Memory unavailable for this session"
+        if not self.config.get("enable_admin_global_memory_tool", False):
+            return "Global memory tool is disabled in plugin config"
+
+        if not event.is_admin():
+            return "Only administrators can store global memories"
+
+        if not self.memory_mgr:
+            return "Memory plugin not initialized"
+
+        # 参数校验
+        mem_type_lower = memory_type.lower().strip()
+        if mem_type_lower not in ALLOWED_MEMORY_TYPES:
+            valid = ", ".join(sorted(ALLOWED_MEMORY_TYPES))
+            return f"Error: invalid memory_type '{memory_type}'. Valid types: {valid}"
+
+        content = _sanitize_memory_content(content)
+        if not content:
+            return "Invalid memory content"
+
+        domain = normalize_domain(mem_type_lower)
+        uri = str(MemoryURI.generate(domain))
+
+        await self.memory_mgr.store_memory(
+            event=event,
+            content=content,
+            domain=domain,
+            uri=uri,
+            memory_type=MemoryType.PERMANENT,
+            disclosure=_sanitize_memory_content(disclosure)[:200] if disclosure else "",
+            importance=5,
+            memory_scope=MemoryScope.GLOBAL,
+            visibility="group",
+            subject="global",
+        )
+        return f"Global memory stored: {uri}"
+
+    @filter.llm_tool(name="memory_search_admin")
+    async def tool_search_admin(
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        domain: str = "",
+        scope: str = "",
+        top_k: int = 5,
+    ) -> str:
+        """Search active memories across scopes for an administrator.
+
+        Use only for an administrator's explicit memory-management request.
+
+        Args:
+            query(string): search keywords or question
+            domain(string): optional filter (user_profile/preferences/facts/events/context)
+            scope(string): optional exact scope (global/personal/group/conversation)
+            top_k(int): number of results, from 1 to 20
+        """
+        if str(getattr(event, "unified_msg_origin", "")) not in self.config.get("allowed_friend_sessions", []):
+            return "Memory unavailable for this session"
+        if not self.config.get("enable_admin_global_memory_tool", False):
+            return "Administrator memory management tool is disabled in plugin config"
+        if not event.is_admin():
+            return "Only administrators can search memories across scopes"
+        if not self.memory_mgr:
+            return "Memory plugin not initialized"
+        query = _sanitize_memory_content(query)
+        if not query:
+            return "Error: query is required"
+        domain_filter: str | None = None
+        if domain:
+            domain_filter = domain.lower().strip()
+            if domain_filter not in VALID_TOOL_DOMAINS:
+                valid = ", ".join(sorted(VALID_TOOL_DOMAINS))
+                return f"Error: invalid domain '{domain}'. Valid domains: {valid}"
+        scope_filter: str | None = None
+        if scope:
+            scope_filter = scope.lower().strip()
+            if scope_filter not in ADMIN_MANAGED_SCOPES:
+                valid = ", ".join(sorted(ADMIN_MANAGED_SCOPES))
+                return f"Error: invalid scope '{scope}'. Valid scopes: {valid}"
+        if isinstance(top_k, bool):
+            return f"Error: top_k must be an integer between 1 and 20, got '{top_k}'"
+        try:
+            top_k_value = int(top_k)
+        except (TypeError, ValueError):
+            return f"Error: top_k must be an integer between 1 and 20, got '{top_k}'"
+        if not 1 <= top_k_value <= 20:
+            return f"Error: top_k must be between 1 and 20, got {top_k_value}"
+        memories = await self.memory_mgr.recall_memories(
+            event,
+            query,
+            domain=domain_filter,
+            top_k=top_k_value,
+            all_users=True,
+            memory_scope=scope_filter,
+            bump=False,
+            source="tool_search_admin",
+        )
+        if not memories:
+            return "No active memories found"
+        result = format_memory_for_injection(
+            memories,
+            timezone_name=self._get_display_timezone(),
+            viewer_user_id=self._get_viewer_user_id(event),
+        )
+        targets = []
+        for memory in memories:
+            metadata = memory.get("metadata")
+            if not isinstance(metadata, dict) or not metadata.get("uri"):
+                continue
+            memory_scope = str(metadata.get("memory_scope", ""))
+            owner_field = ADMIN_SCOPE_OWNER_FIELDS.get(memory_scope, "")
+            owner_id = str(metadata.get(owner_field, "")) if owner_field else ""
+            targets.append(
+                f"- uri={metadata['uri']}; scope={memory_scope}; "
+                f"owner_id={owner_id or 'global'}"
+            )
+        targets_section = "\n".join(dict.fromkeys(targets))
+        return (
+            "<administrator_memory_management_results>\n"
+            f"Exact management targets:\n{targets_section}\n"
+            f"{result}\n</administrator_memory_management_results>"
+        )
+
+    @filter.llm_tool(name="memory_remove_admin")
+    async def tool_remove_admin(
+        self,
+        event: AstrMessageEvent,
+        uri: str,
+        scope: str,
+        owner_id: str = "",
+        confirm: str = "",
+    ) -> str:
+        """Preview then remove one exact-scope memory target for an administrator.
+
+        Args:
+            uri(string): exact memory URI returned by memory_search_admin
+            scope(string): exact scope (global/personal/group/conversation)
+            owner_id(string): required owner_user_id, owner_session_id, or umo for non-global scopes
+            confirm(string): confirmation code from the removal preview
+        """
+        if str(getattr(event, "unified_msg_origin", "")) not in self.config.get("allowed_friend_sessions", []):
+            return "Memory unavailable for this session"
+        if not self.config.get("enable_admin_global_memory_tool", False):
+            return "Administrator memory management tool is disabled in plugin config"
+        if not event.is_admin():
+            return "Only administrators can remove memories across scopes"
+        if not self.memory_mgr:
+            return "Memory plugin not initialized"
+        uri = (uri or "").strip()
+        if not uri:
+            return "Error: uri is required"
+        try:
+            MemoryURI.parse(uri)
+        except ValueError as exc:
+            return f"Error: invalid memory URI '{uri}': {exc}"
+        scope_value = (scope or "").lower().strip()
+        if scope_value not in ADMIN_MANAGED_SCOPES:
+            valid = ", ".join(sorted(ADMIN_MANAGED_SCOPES))
+            return f"Error: invalid scope '{scope}'. Valid scopes: {valid}"
+        owner_field = ADMIN_SCOPE_OWNER_FIELDS.get(scope_value, "")
+        owner_value = (owner_id or "").strip()
+        if owner_field and not owner_value:
+            return (
+                f"Error: owner_id is required for scope '{scope_value}' ({owner_field})"
+            )
+        if not owner_field and owner_value:
+            return "Error: owner_id must be empty for scope 'global'"
+        preview = await self.memory_mgr.preview_admin_memory_removal(
+            uri, scope_value, owner_value
+        )
+        if preview["count"] == 0:
+            return "Error: active memory not found for the exact URI, scope, and owner"
+        confirmation_code = _confirmation_code("remove-admin", preview["fingerprint"])
+        if str(confirm or "").strip() != confirmation_code:
+            return _format_admin_removal_preview(
+                uri,
+                scope_value,
+                owner_value,
+                preview,
+                confirmation_code,
+                owner_field,
+            )
+        outcome = await self.memory_mgr.forget_admin_memory_by_target(
+            uri, scope_value, owner_value, preview["fingerprint"]
+        )
+        if outcome["status"] == "changed":
+            current = outcome["preview"]
+            current_code = _confirmation_code("remove-admin", current["fingerprint"])
+            return (
+                "Error: memory changed since preview; no deletion occurred.\n"
+                + _format_admin_removal_preview(
+                    uri,
+                    scope_value,
+                    owner_value,
+                    current,
+                    current_code,
+                    owner_field,
+                )
+            )
+        if outcome["status"] == "not_found":
+            return "Error: active memory not found for the exact URI, scope, and owner"
+        return f"Memory deleted: {uri} ({outcome['deleted']} record(s))"
+
+    @filter.llm_tool(name="memory_forget")
+    async def tool_forget(self, event: AstrMessageEvent, uri: str) -> str:
+        """Delete a specific memory by URI
+
+        Args:
+            uri(string): memory URI identifier
+        """
+        if str(getattr(event, "unified_msg_origin", "")) not in self.config.get("allowed_friend_sessions", []):
+            return "Memory unavailable for this session"
+        if not self.memory_mgr:
+            return "Memory plugin not initialized"
+
+        deleted = await self.memory_mgr.forget_memory(event, uri)
+        if deleted == 0:
+            return f"Memory not found or not permitted: {uri}"
+        return f"Memory deleted: {uri} ({deleted} record(s))"

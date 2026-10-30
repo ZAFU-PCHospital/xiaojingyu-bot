@@ -1,0 +1,8 @@
+name: astrbot_plugin_hospital_proactive
+display_name: 客服小鲸鱼主动答疑
+desc: 三分类候选，主模型显式回答/跳过，非求助不主动拒绝；@独立保留。
+version: v0.3.0
+author: Xiaoyuan
+astrbot_version: ">=4.29,<5"
+support_platforms:
+  - qq_official_webhook

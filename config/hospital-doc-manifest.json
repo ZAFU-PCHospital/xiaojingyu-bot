@@ -1,0 +1,107 @@
+{
+  "commit": "d676e4fc6cdb0bcd25f956704fad5d7e52ecf504",
+  "files": [
+    {
+      "path": "src/Basics/OS.md",
+      "url": "https://github.com/ZAFU-PCHospital/ZAFU-PCHospital-Doc/blob/d676e4fc6cdb0bcd25f956704fad5d7e52ecf504/src/Basics/OS.md",
+      "sha256": "e04ef8277ce3e898339c5bb86093ba083ecf43628518db9fed0f431a361281ed",
+      "chunks": 19
+    },
+    {
+      "path": "src/Basics/Shortcuts.md",
+      "url": "https://github.com/ZAFU-PCHospital/ZAFU-PCHospital-Doc/blob/d676e4fc6cdb0bcd25f956704fad5d7e52ecf504/src/Basics/Shortcuts.md",
+      "sha256": "780508e969fb4a9ebb384a3992a5d0fbe3000fddde292c725712dac2d44fcd66",
+      "chunks": 18
+    },
+    {
+      "path": "src/Disk/Health.md",
+      "url": "https://github.com/ZAFU-PCHospital/ZAFU-PCHospital-Doc/blob/d676e4fc6cdb0bcd25f956704fad5d7e52ecf504/src/Disk/Health.md",
+      "sha256": "64f802720b227a8af1e229715a4fb24cebab95d88a67b6fefdd470c7ace68a99",
+      "chunks": 8
+    },
+    {
+      "path": "src/Driver/Installation.md",
+      "url": "https://github.com/ZAFU-PCHospital/ZAFU-PCHospital-Doc/blob/d676e4fc6cdb0bcd25f956704fad5d7e52ecf504/src/Driver/Installation.md",
+      "sha256": "3f347970252a84bab8dd6d56069054de194a8329372e28bc1738544da70c0b64",
+      "chunks": 18
+    },
+    {
+      "path": "src/Hardware/BootIssue/BlackScreen.md",
+      "url": "https://github.com/ZAFU-PCHospital/ZAFU-PCHospital-Doc/blob/d676e4fc6cdb0bcd25f956704fad5d7e52ecf504/src/Hardware/BootIssue/BlackScreen.md",
+      "sha256": "9a9a974d84dc4faeb36425a83708c8a2bf7904a45fc13ff9b708c7b55c2dbab7",
+      "chunks": 15
+    },
+    {
+      "path": "src/Intro.md",
+      "url": "https://github.com/ZAFU-PCHospital/ZAFU-PCHospital-Doc/blob/d676e4fc6cdb0bcd25f956704fad5d7e52ecf504/src/Intro.md",
+      "sha256": "7b7cabc708ba3ad892d013571348b622d3de85753a723a8e1895af131506bc64",
+      "chunks": 3
+    },
+    {
+      "path": "src/Manual/KnowledgeBase/CADUninstall.md",
+      "url": "https://github.com/ZAFU-PCHospital/ZAFU-PCHospital-Doc/blob/d676e4fc6cdb0bcd25f956704fad5d7e52ecf504/src/Manual/KnowledgeBase/CADUninstall.md",
+      "sha256": "846e29b6a8b0cc3c34f8da6d39d0a5748223cad22697e9365d901858b867c817",
+      "chunks": 7
+    },
+    {
+      "path": "src/Manual/KnowledgeBase/OMENFanStop.md",
+      "url": "https://github.com/ZAFU-PCHospital/ZAFU-PCHospital-Doc/blob/d676e4fc6cdb0bcd25f956704fad5d7e52ecf504/src/Manual/KnowledgeBase/OMENFanStop.md",
+      "sha256": "b06691a4b7611e8d52fe6b5c9d74c4559a3d9f00b04ffcface695609b89605fd",
+      "chunks": 3
+    },
+    {
+      "path": "src/Manual/KnowledgeBase/VCInstall.md",
+      "url": "https://github.com/ZAFU-PCHospital/ZAFU-PCHospital-Doc/blob/d676e4fc6cdb0bcd25f956704fad5d7e52ecf504/src/Manual/KnowledgeBase/VCInstall.md",
+      "sha256": "a2bc970c5f578991bd1ee4a2c8623092c704bda2d267765cf9fa7d6054b54496",
+      "chunks": 16
+    },
+    {
+      "path": "src/Manual/KnowledgeBase/WindowsUserProfileService.md",
+      "url": "https://github.com/ZAFU-PCHospital/ZAFU-PCHospital-Doc/blob/d676e4fc6cdb0bcd25f956704fad5d7e52ecf504/src/Manual/KnowledgeBase/WindowsUserProfileService.md",
+      "sha256": "4d3cf29d62e20fb19de0c6592c41361bd33af86c62535add0a592f537448c87d",
+      "chunks": 4
+    },
+    {
+      "path": "src/Manual/OfficialSupport.md",
+      "url": "https://github.com/ZAFU-PCHospital/ZAFU-PCHospital-Doc/blob/d676e4fc6cdb0bcd25f956704fad5d7e52ecf504/src/Manual/OfficialSupport.md",
+      "sha256": "640fdc140fc8391cfbd5359d2e88a99751bc33d91a2062eed28bac5a3000458f",
+      "chunks": 16
+    },
+    {
+      "path": "src/Manual/Regulations.md",
+      "url": "https://github.com/ZAFU-PCHospital/ZAFU-PCHospital-Doc/blob/d676e4fc6cdb0bcd25f956704fad5d7e52ecf504/src/Manual/Regulations.md",
+      "sha256": "6b336fe0c5d7252e4cf632955ae83bfc3256c7d88a6bff7609dc5df512f77f96",
+      "chunks": 3
+    },
+    {
+      "path": "src/Manual/ThirdPartyRepair.md",
+      "url": "https://github.com/ZAFU-PCHospital/ZAFU-PCHospital-Doc/blob/d676e4fc6cdb0bcd25f956704fad5d7e52ecf504/src/Manual/ThirdPartyRepair.md",
+      "sha256": "af79f59c5aef5770f74ad17121fff2e68e852334f4e017e006beb636df468348",
+      "chunks": 1
+    },
+    {
+      "path": "src/Manual/Workflow.md",
+      "url": "https://github.com/ZAFU-PCHospital/ZAFU-PCHospital-Doc/blob/d676e4fc6cdb0bcd25f956704fad5d7e52ecf504/src/Manual/Workflow.md",
+      "sha256": "5e9a6e0feff48c72999f0533fd6b79c35cb1459e6a3b700875f4c7b065ddf062",
+      "chunks": 15
+    },
+    {
+      "path": "src/Software/Recommended.md",
+      "url": "https://github.com/ZAFU-PCHospital/ZAFU-PCHospital-Doc/blob/d676e4fc6cdb0bcd25f956704fad5d7e52ecf504/src/Software/Recommended.md",
+      "sha256": "8cd068e826aac9849013cb3eacbed34c3aaa073e14a34e776403cdda188bb42a",
+      "chunks": 25
+    },
+    {
+      "path": "src/ZAFUNetWork/Login.md",
+      "url": "https://github.com/ZAFU-PCHospital/ZAFU-PCHospital-Doc/blob/d676e4fc6cdb0bcd25f956704fad5d7e52ecf504/src/ZAFUNetWork/Login.md",
+      "sha256": "b443dced09380610d742cd2e6d2f8e5c897e9b16b5c31620ffd0bd62ccd1d989",
+      "chunks": 7
+    },
+    {
+      "path": "src/ZAFUNetWork/RemoteAccess.md",
+      "url": "https://github.com/ZAFU-PCHospital/ZAFU-PCHospital-Doc/blob/d676e4fc6cdb0bcd25f956704fad5d7e52ecf504/src/ZAFUNetWork/RemoteAccess.md",
+      "sha256": "e3e0fc2bbcbc9b1ec24db602d71f3f960eab37daf70f5c4ade6739761499c600",
+      "chunks": 17
+    }
+  ]
+}

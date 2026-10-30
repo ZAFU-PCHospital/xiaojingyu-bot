@@ -1,0 +1,6 @@
+{
+  "announcements_enabled": {"description": "创建活动时预览并确认后向三个固定群发送普通通知；首次配置完成后才启用", "type": "bool", "default": false},
+  "enabled_sessions": {"description": "仅允许的完整官方QQ会话标识", "type": "list", "default": []},
+  "data_path": {"description": "草稿与执行记录目录", "type": "string", "default": "data/plugin_data/management_whale"},
+  "private_config_path": {"description": "仅服务端可读的接入凭证文件路径，不在群聊提供凭证", "type": "string", "default": "/AstrBot/data/plugin_data/management_whale/credentials.private.json"}
+}

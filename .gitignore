@@ -1,0 +1,16 @@
+/.env
+/data/
+/secrets/
+/.local/
+**/__pycache__/
+*.py[cod]
+*.pem
+*.key
+*.private.json
+*.sqlite*
+*.db
+*.db-shm
+*.db-wal
+*.dmp
+*.log
+*.zip

@@ -1,0 +1,17 @@
+{
+  "auto_reply_sessions": {
+    "description": "允许随机参与的精确会话ID，仅群友群",
+    "type": "list",
+    "default": []
+  },
+  "auto_reply_probability": {
+    "description": "普通消息随机回复概率（@及指令不受此概率限制）",
+    "type": "float",
+    "default": 0.0
+  },
+  "separate_official_messages": {
+    "description": "官方群友回复以独立消息分段（最多3条，客服群不应用）",
+    "type": "bool",
+    "default": false
+  }
+}

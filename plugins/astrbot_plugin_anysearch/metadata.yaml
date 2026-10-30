@@ -1,0 +1,14 @@
+name: astrbot_plugin_anysearch
+display_name: Anysearch实时联网搜索
+short_desc: 基于 Anysearch 的实时联网搜索工具，响应快、覆盖广，并支持批量查询与网页正文提取。
+desc: Anysearch实时联网搜索插件为 AstrBot 提供免费的原生联网检索能力。它直接调用 Anysearch API，支持通用网页搜索、新闻与文档检索、批量查询和网页正文提取，适合让 Bot 在回答中获取更及时、更可靠、更稳定的外部信息。
+help: 使用 /anysearch 关键词 进行实时搜索；/anysearch extract URL 提取网页正文；/anysearch batch 关键词1,关键词2 批量搜索。也可以让 LLM 自动调用 Anysearch 工具。
+version: v0.3
+author: AgIzT
+repo: https://github.com/AgIzT/astrbot_plugin_anysearch
+astrbot_version: ">=4.16,<5"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - telegram
+  - lark

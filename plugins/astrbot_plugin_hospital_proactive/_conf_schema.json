@@ -1,0 +1,11 @@
+{
+  "enabled": {"description":"主动答疑总开关；关闭不影响原@入口","type":"bool","default":false},
+  "enabled_sessions": {"description":"启用的客服群完整会话标识","type":"list","default":[]},
+  "model": {"description":"单条消息三分类模型","type":"string","default":"cn:hy3"},
+  "help_ttl_seconds": {"description":"同群同用户求助续接有效期；只由实际回复刷新","type":"int","default":600},
+  "daily_classifier_limit": {"description":"每日分类次数上限；0不限，@不受限","type":"int","default":0},
+  "classifier_timeout_seconds": {"description":"分类超时；异常有限转交主模型，不自动重试","type":"int","default":20},
+  "max_input_chars": {"description":"自动处理单条文字最大长度；@不受限","type":"int","default":4000},
+  "private_config_path": {"description":"服务端网关凭证文件路径","type":"string","default":"/AstrBot/data/plugin_data/hospital_proactive/credentials.private.json"},
+  "data_path": {"description":"仅保存计数；续接内容在内存，超时或重载清除","type":"string","default":"/AstrBot/data/plugin_data/hospital_proactive"}
+}

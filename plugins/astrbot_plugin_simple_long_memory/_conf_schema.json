@@ -1,0 +1,438 @@
+{
+  "kb_name": {
+    "description": "记忆知识库",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "_special": "select_knowledgebase",
+    "hint": "选择用于存储长期记忆的知识库（必填，请先在知识库管理中创建，知识库需配置嵌入模型）"
+  },
+  "extraction_provider_id": {
+    "description": "记忆提取模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "用于从对话中提取记忆的LLM模型（留空则使用会话主LLM）"
+  },
+  "summarization_provider_id": {
+    "description": "记忆总结模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "用于记忆合并、压缩等总结操作的LLM模型（留空则使用会话主LLM）"
+  },
+  "auto_memorize": {
+    "description": "自动记忆模式",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后会在对话后自动提取并存储记忆"
+  },
+  "extraction_interval": {
+    "description": "记忆提取间隔(轮)",
+    "type": "int",
+    "default": 20,
+    "hint": "每N轮对话后触发一次记忆提取，对这N轮对话内容进行总结",
+    "slider": {
+      "min": 5,
+      "max": 200,
+      "step": 1
+    }
+  },
+  "extraction_min_content_length": {
+    "description": "最小提取内容长度",
+    "type": "int",
+    "default": 150,
+    "hint": "对话总内容低于此字符数时跳过记忆提取，避免无意义短对话被记忆"
+  },
+  "global_memory": {
+    "description": "按人跨会话共享",
+    "type": "bool",
+    "default": true,
+    "hint": "同一平台实例内，个人记忆跟随本人跨群聊和私聊召回；关闭后仅本会话可见。保留旧配置键，不控制群公共记忆或 global 记忆"
+  },
+  "share_group_across_groups": {
+    "description": "跨群聊共用",
+    "type": "bool",
+    "default": false,
+    "hint": "仅将 group 公共记忆共享给同一平台实例的其他群聊，不进入私聊，不扩展 personal 或 conversation 可见性。开启前注意群间隐私边界"
+  },
+  "recall_query_max_chars": {
+    "description": "召回查询字符上限",
+    "type": "int",
+    "default": 1200,
+    "hint": "限制自动注入与工具召回的查询长度（128–2048）；优先保留当前提问。字符预算不等于模型 token 限制，明确超限时全轮最多缩短重试一次"
+  },
+  "recall_timeout_seconds": {
+    "description": "召回总预算（秒）",
+    "type": "int",
+    "default": 12,
+    "hint": "召回通道共用截止时间（2–30 秒）；自动注入的查询优化最多占 40%。单通道失败保留其他可用结果，不重试整轮"
+  },
+  "max_memories_per_inject": {
+    "description": "每次注入的记忆数量",
+    "type": "int",
+    "default": 5,
+    "hint": "LLM请求时注入的最大记忆条数"
+  },
+  "max_memory_list_scan": {
+    "description": "记忆列表扫描上限",
+    "type": "int",
+    "default": 200,
+    "hint": "限制 /memory list 为计算当前用户可见记忆而扫描的最大记录数。实际扫描量会按当前页码和每页数量推导，并不会超过此上限",
+    "slider": {
+      "min": 20,
+      "max": 2000,
+      "step": 20
+    }
+  },
+  "memory_delete_scan_page_size": {
+    "description": "记忆删除扫描分页大小",
+    "type": "int",
+    "default": 1000,
+    "hint": "删除或清空记忆前，每页扫描多少条匹配记录用于同步清理知识库文档记录。数值越大速度越快但单次内存占用更高",
+    "slider": {
+      "min": 100,
+      "max": 5000,
+      "step": 100
+    }
+  },
+  "memory_ttl_days": {
+    "description": "记忆生命周期(天)",
+    "type": "int",
+    "default": 30,
+    "hint": "超过此天数的低频记忆将被压缩为印象"
+  },
+  "use_reranker": {
+    "description": "启用重排序",
+    "type": "bool",
+    "default": true,
+    "hint": "记忆召回时使用知识库配置的重排序模型优化结果排序。需先在知识库设置中配置重排序模型，未配置时此选项无效"
+  },
+  "optimize_recall_query": {
+    "description": "启用检索优化",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后在每次记忆召回前调用记忆提取模型提炼检索关键词，提高召回准确率。每次对话都会调用，建议配置响应速度快的轻量模型"
+  },
+  "optimize_recall_query_timeout": {
+    "description": "检索优化超时(秒)",
+    "type": "int",
+    "default": 10,
+    "hint": "限制检索优化模型调用的最长等待时间。超时后将跳过优化并使用原始检索内容，避免阻塞对话响应",
+    "slider": {
+      "min": 1,
+      "max": 20,
+      "step": 1
+    }
+  },
+  "enable_admin_global_memory_tool": {
+    "description": "启用管理员全局记忆工具",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后提供管理员全局记忆写入，以及跨 global/personal/group/conversation 的精确搜索和确认删除工具"
+  },
+  "recall_sparse_fusion": {
+    "description": "启用稀疏检索融合",
+    "type": "bool",
+    "default": true,
+    "hint": "召回时在稠密向量之外追加 FTS5 关键词稀疏检索，并用 RRF 融合两路结果，提升关键词/专有名词召回率。依赖知识库 FTS5 索引，不可用时自动回退纯稠密"
+  },
+  "recall_weight_importance": {
+    "description": "召回加权-重要性",
+    "type": "float",
+    "default": 0.4,
+    "hint": "召回结果二次排序中 importance 的权重（0-1）"
+  },
+  "recall_weight_frequency": {
+    "description": "召回加权-召回频次",
+    "type": "float",
+    "default": 0.3,
+    "hint": "召回结果二次排序中 recall_count 频次的权重（0-1）"
+  },
+  "recall_weight_recency": {
+    "description": "召回加权-时效",
+    "type": "float",
+    "default": 0.3,
+    "hint": "召回结果二次排序中时间衰减的权重（0-1）"
+  },
+  "recall_recency_halflife_days": {
+    "description": "召回时效半衰期(天)",
+    "type": "int",
+    "default": 14,
+    "hint": "时效衰减半衰期：距今 N 天的记忆时效分约为 0.5"
+  },
+  "memory_consolidation_enabled": {
+    "description": "启用记忆巩固",
+    "type": "bool",
+    "default": true,
+    "hint": "定期将低频老旧记忆交由 LLM 压缩为摘要印象，原文标记为已废弃。需配置总结模型"
+  },
+  "consolidation_min_age_days": {
+    "description": "巩固最小年龄(天)",
+    "type": "int",
+    "default": 14,
+    "hint": "仅巩固创建超过此天数的记忆"
+  },
+  "consolidation_max_recall": {
+    "description": "巩固召回频次上限",
+    "type": "int",
+    "default": 1,
+    "hint": "仅巩固历史召回次数不超过此值的低频记忆（避免压缩高频使用中的记忆）"
+  },
+  "consolidation_batch_size": {
+    "description": "巩固批量大小",
+    "type": "int",
+    "default": 30,
+    "hint": "每次巩固任务处理的记忆条数上限"
+  },
+  "maintenance_enabled": {
+    "description": "后台整理总开关",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后按 cron 定时执行记忆整理任务（需配置整理模型）"
+  },
+  "maintenance_model_id": {
+    "description": "整理模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "用于后台整理 Agent 的 LLM 模型，建议使用廉价模型（留空则使用会话主 LLM）"
+  },
+  "maintenance_window": {
+    "description": "整理时间窗口",
+    "type": "string",
+    "default": "02:00-06:00",
+    "hint": "单时间点如 03:00，或范围如 02:00-06:00；整理 cron 命中窗口外时仅记 DEBUG 日志并跳过"
+  },
+  "maintenance_cron": {
+    "description": "整理周期定时表达式",
+    "type": "string",
+    "default": "0 3 * * *",
+    "hint": "标准 cron 表达式，默认每天 03:00 执行完整整理管线（purge + 整理师 + 分析师 + 审核员）"
+  },
+  "maintenance_max_llm_calls": {
+    "description": "每周期 LLM 调用上限",
+    "type": "int",
+    "default": 50,
+    "hint": "单个整理周期内所有 Agent 的 LLM 调用次数硬上限"
+  },
+  "maintenance_max_ops_per_cycle": {
+    "description": "每周期操作数上限",
+    "type": "int",
+    "default": 100,
+    "hint": "整理师+分析师单周期产出的操作总数硬上限，超出部分本周期跳过（下周期重新评估），防止异常放大"
+  },
+  "maintenance_analyst_max_new_links": {
+    "description": "分析师每次最多新建关联数",
+    "type": "int",
+    "default": 20,
+    "hint": "单个整理周期内分析师最多新建的关联边数量"
+  },
+  "maintenance_analyst_detect_contradiction": {
+    "description": "分析师同时检测矛盾",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后分析师会检测互相矛盾的记忆对"
+  },
+  "maintenance_analyst_max_contradictions": {
+    "description": "分析师每次最多报告矛盾数",
+    "type": "int",
+    "default": 20,
+    "hint": "单个整理周期内分析师最多报告的矛盾记忆对数量，超出部分截断"
+  },
+  "maintenance_reviewer_enabled": {
+    "description": "启用审核员",
+    "type": "bool",
+    "default": true,
+    "hint": "复核整理师和分析师的操作建议，防止误删误改"
+  },
+  "maintenance_reviewer_model_id": {
+    "description": "审核模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "留空使用全局整理模型，建议用更可靠的模型做审核"
+  },
+  "maintenance_organizer_enabled": {
+    "description": "启用整理师",
+    "type": "bool",
+    "default": true,
+    "hint": "去重合并相似记忆、精炼措辞、归档无价值条目"
+  },
+  "maintenance_analyst_enabled": {
+    "description": "启用分析师",
+    "type": "bool",
+    "default": true,
+    "hint": "拉取对话历史，发现记忆间隐含关联，检测矛盾"
+  },
+  "maintenance_extract_enabled": {
+    "description": "启用对话提取",
+    "type": "bool",
+    "default": true,
+    "hint": "整理周期内从平台消息历史切分对话块并提取新记忆（分段员+整理师），关闭后只做存量记忆整理"
+  },
+  "maintenance_segmenter_model_id": {
+    "description": "分段模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "用于判断对话块是否闭环的 LLM 模型，留空使用全局整理模型"
+  },
+  "maintenance_curator_model_id": {
+    "description": "提取整理模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "用于从对话块提取记忆的 LLM 模型，留空使用全局整理模型"
+  },
+  "maintenance_segment_time_gap_minutes": {
+    "description": "分段时间间隙(分钟)",
+    "type": "int",
+    "default": 30,
+    "hint": "相邻消息间隔超过此值时预切为不同对话块"
+  },
+  "maintenance_segment_max_chars": {
+    "description": "对话块最大字符数",
+    "type": "int",
+    "default": 8000,
+    "hint": "单个对话块扁平化文本的最大字符数，超出后滚动并入下一段重判"
+  },
+  "maintenance_segment_max_extensions": {
+    "description": "分段最大滚动扩展次数",
+    "type": "int",
+    "default": 3,
+    "hint": "对话块未闭环时最多并入后续段的次数，超限后挂起等待下周期"
+  },
+  "maintenance_extract_max_blocks_per_cycle": {
+    "description": "每周期最大对话块数",
+    "type": "int",
+    "default": 20,
+    "hint": "单个整理周期内分段员最多产出的对话块数量，超出部分下周期处理"
+  },
+  "maintenance_extract_llm_budget_ratio": {
+    "description": "提取 LLM 预算占比",
+    "type": "float",
+    "default": 0.6,
+    "hint": "每周期 LLM 调用上限中分配给对话提取（分段+提取）的比例，其余留给存量整理"
+  },
+  "maintenance_extract_conv2_enabled": {
+    "description": "ConversationV2 兜底提取",
+    "type": "bool",
+    "default": true,
+    "hint": "无平台消息历史的会话（如私聊）改用 LLM 对话记录兜底提取"
+  },
+  "maintenance_extract_conv2_chunk_messages": {
+    "description": "ConversationV2 分段消息数",
+    "type": "int",
+    "default": 40,
+    "hint": "ConversationV2 对话记录无时间戳，按每 N 条消息切为一个候选块"
+  },
+  "review_notify_enabled": {
+    "description": "待审通知开关",
+    "type": "bool",
+    "default": true,
+    "hint": "争议操作产生时主动通知管理员"
+  },
+  "review_notify_umo": {
+    "description": "通知目标 UMO",
+    "type": "string",
+    "default": "",
+    "hint": "填写群聊或私聊的 unified_msg_origin，留空则自动发给最近一次执行管理命令的管理员"
+  },
+  "review_notify_schedule": {
+    "description": "通知频率",
+    "type": "string",
+    "default": "daily",
+    "options": [
+      "daily",
+      "weekly",
+      "monthly"
+    ],
+    "hint": "daily=每天固定时间, weekly=每周固定日, monthly=每月固定日"
+  },
+  "review_notify_time": {
+    "description": "通知时间",
+    "type": "string",
+    "default": "10:00",
+    "hint": "daily 为每天时刻，weekly 为周几+时刻如 mon:10:00，monthly 为几号+时刻如 1:10:00"
+  },
+  "maintenance_pending_queue_max": {
+    "description": "待审队列容量上限",
+    "type": "int",
+    "default": 500,
+    "hint": "待人工审核队列的最大长度，满了之后新争议项直接丢弃并记日志，防止队列无限膨胀"
+  },
+  "auto_purge_enabled": {
+    "description": "自动清理废弃记忆",
+    "type": "bool",
+    "default": true,
+    "hint": "定期物理删除已标记废弃超期的记忆"
+  },
+  "auto_purge_after_days": {
+    "description": "清理超期天数",
+    "type": "int",
+    "default": 7,
+    "hint": "deprecated 标记超过此天数后物理删除"
+  },
+  "auto_purge_cron": {
+    "description": "清理定时表达式",
+    "type": "string",
+    "default": "0 5 * * *",
+    "hint": "标准 cron 表达式，默认每天 05:00 执行"
+  },
+  "maintenance_tasks": {
+    "description": "整理团队编排",
+    "type": "list",
+    "items": {
+      "type": "object"
+    },
+    "default": [],
+    "hint": "添加后台整理角色（organizer/analyst/reviewer），配置执行时间和行为"
+  },
+  "context_max_rounds": {
+    "description": "最大拉取对话轮数",
+    "type": "int",
+    "default": 50,
+    "hint": "分析师拉取对话历史的最大轮数"
+  },
+  "context_max_chars": {
+    "description": "最大拉取字符数",
+    "type": "int",
+    "default": 30000,
+    "hint": "分析师拉取对话历史的最大总字符数"
+  },
+  "context_max_age_days": {
+    "description": "对话最大回溯天数",
+    "type": "int",
+    "default": 7,
+    "hint": "分析师只拉取最近 N 天的对话"
+  },
+  "persona_mode": {
+    "description": "人格加载模式",
+    "type": "string",
+    "default": "auto",
+    "options": [
+      "auto",
+      "manual",
+      "off"
+    ],
+    "hint": "auto=自动从主人格提取摘要, manual=使用下方自定义, off=不加载"
+  },
+  "persona_summary": {
+    "description": "自定义人格摘要",
+    "type": "text",
+    "default": "",
+    "hint": "manual 模式下填写，帮助整理 Agent 理解对话语境"
+  },
+  "allowed_friend_sessions": {
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "description": "允许使用记忆的群聊会话",
+    "default": [],
+    "hint": "仅允许列表内群友群；空列表禁用所有群聊入口"
+  }
+}

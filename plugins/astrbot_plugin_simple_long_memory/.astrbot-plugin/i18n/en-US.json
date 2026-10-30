@@ -1,0 +1,157 @@
+{
+  "metadata": {
+    "display_name": "Simple Long Memory",
+    "short_desc": "Knowledge-base backed long-term memory, recall, and management tools.",
+    "desc": "Adds long-term memory to AstrBot using the built-in knowledge base for user preferences, past interactions, and important facts."
+  },
+  "config": {
+    "kb_name": {
+      "description": "Memory Knowledge Base",
+      "hint": "Select the knowledge base used to store long-term memories. Required. Create one first in Knowledge Base Management and configure an embedding model."
+    },
+    "extraction_provider_id": {
+      "description": "Memory Extraction Model",
+      "hint": "LLM used to extract memories from conversations. Leave empty to use the current chat model."
+    },
+    "summarization_provider_id": {
+      "description": "Memory Summarization Model",
+      "hint": "LLM used for future memory merging and compression. Leave empty to use the current chat model."
+    },
+    "auto_memorize": {
+      "description": "Automatic Memory Mode",
+      "hint": "When enabled, memories are automatically extracted and stored after conversations."
+    },
+    "extraction_interval": {
+      "description": "Extraction Interval (turns)",
+      "hint": "Run memory extraction every N conversation turns and summarize those turns."
+    },
+    "extraction_min_content_length": {
+      "description": "Minimum Extraction Length",
+      "hint": "Skip memory extraction when the accumulated conversation is shorter than this many characters."
+    },
+    "global_memory": {
+      "description": "Per-Person Cross-Session Sharing",
+      "hint": "Within the same platform instance, personal memories follow their owners across groups and DMs. Disable to restrict them to their original session. Does not control group or global memories."
+    },
+    "share_group_across_groups": {
+      "description": "Cross-Group Sharing",
+      "hint": "Share group-scoped memories with other groups of the same platform instance, never DMs. Does not expand personal or conversation visibility."
+    },
+    "recall_query_max_chars": {
+      "description": "Recall Query Character Limit",
+      "hint": "Bound automatic and tool recall queries to 128–2048 characters, preserving the current question first. Explicit length errors allow at most one shortened retry per recall."
+    },
+    "recall_timeout_seconds": {
+      "description": "Recall Time Budget (seconds)",
+      "hint": "All recall channels share a 2–30 second deadline; automatic query optimization uses at most 40%. Keep successful channels without retrying the whole operation."
+    },
+    "max_memories_per_inject": {
+      "description": "Memories Per Injection",
+      "hint": "Maximum number of memories injected into each LLM request."
+    },
+    "max_memory_list_scan": {
+      "description": "Memory List Scan Limit",
+      "hint": "Limits how many records /memory list scans to calculate memories visible to the current user. The actual scan amount is derived from the page and page size and will not exceed this limit."
+    },
+    "memory_delete_scan_page_size": {
+      "description": "Delete Scan Page Size",
+      "hint": "Number of matched records scanned per page before deleting or clearing memories. Larger values are faster but use more memory per operation."
+    },
+    "memory_ttl_days": {
+      "description": "Memory TTL (days)",
+      "hint": "Low-frequency memories older than this many days may be compressed into impressions."
+    },
+    "use_reranker": {
+      "description": "Enable Reranker",
+      "hint": "Use the knowledge base reranker to improve memory recall ordering. Requires a reranker model configured on the knowledge base."
+    },
+    "optimize_recall_query": {
+      "description": "Optimize Recall Query",
+      "hint": "Before each memory recall, call the extraction model to extract search keywords for better recall accuracy. This runs on every conversation, so use a fast lightweight model."
+    },
+    "optimize_recall_query_timeout": {
+      "description": "Recall Optimization Timeout (seconds)",
+      "hint": "Maximum wait time for recall query optimization. On timeout, the original query is used so conversation responses are not blocked."
+    },
+    "enable_admin_global_memory_tool": {
+      "description": "Enable Admin Global Memory Tool",
+      "hint": "When enabled, provides administrator-only global-memory storage plus exact search and confirmed removal across global, personal, group, and conversation scopes."
+    },
+    "recall_sparse_fusion": {
+      "description": "Enable Sparse Retrieval Fusion",
+      "hint": "Adds FTS5 keyword sparse retrieval atop dense vector search and fuses both via RRF, improving recall for keywords/proper nouns. Falls back to dense-only when FTS5 is unavailable."
+    },
+    "recall_weight_importance": {
+      "description": "Recall Weight - Importance",
+      "hint": "Weight of importance in recall re-ranking (0-1)"
+    },
+    "recall_weight_frequency": {
+      "description": "Recall Weight - Frequency",
+      "hint": "Weight of recall_count frequency in recall re-ranking (0-1)"
+    },
+    "recall_weight_recency": {
+      "description": "Recall Weight - Recency",
+      "hint": "Weight of time decay in recall re-ranking (0-1)"
+    },
+    "recall_recency_halflife_days": {
+      "description": "Recall Recency Halflife (days)",
+      "hint": "Recency decay halflife: a memory N days old scores about 0.5"
+    },
+    "memory_consolidation_enabled": {
+      "description": "Enable Memory Consolidation",
+      "hint": "Periodically compress low-frequency old memories into summary impressions via LLM; originals are marked deprecated. Requires a summarization model."
+    },
+    "consolidation_min_age_days": {
+      "description": "Consolidation Min Age (days)",
+      "hint": "Only consolidate memories older than this many days"
+    },
+    "consolidation_max_recall": {
+      "description": "Consolidation Max Recall Count",
+      "hint": "Only consolidate low-frequency memories with recall count at or below this (avoids compressing frequently-used memories)"
+    },
+    "consolidation_batch_size": {
+      "description": "Consolidation Batch Size",
+      "hint": "Maximum number of memories processed per consolidation run"
+    },
+    "maintenance_extract_enabled": {
+      "description": "Enable Conversation Extraction",
+      "hint": "During maintenance cycles, segment conversation history into blocks and extract new memories; when off, only existing memories are curated"
+    },
+    "maintenance_segmenter_model_id": {
+      "description": "Segmenter Model",
+      "hint": "LLM used to judge whether a conversation block is complete; falls back to the global maintenance model when empty"
+    },
+    "maintenance_curator_model_id": {
+      "description": "Curator Model",
+      "hint": "LLM used to extract memories from conversation blocks; falls back to the global maintenance model when empty"
+    },
+    "maintenance_segment_time_gap_minutes": {
+      "description": "Segment Time Gap (minutes)",
+      "hint": "Adjacent messages separated by more than this gap are pre-split into different conversation blocks"
+    },
+    "maintenance_segment_max_chars": {
+      "description": "Max Block Characters",
+      "hint": "Maximum characters of a flattened conversation block; beyond this the block rolls into the next segment for re-judgement"
+    },
+    "maintenance_segment_max_extensions": {
+      "description": "Max Segment Extensions",
+      "hint": "Maximum times an incomplete block may absorb following segments before being carried over to the next cycle"
+    },
+    "maintenance_extract_max_blocks_per_cycle": {
+      "description": "Max Blocks per Cycle",
+      "hint": "Maximum conversation blocks the segmenter may emit in one maintenance cycle; the rest is deferred to the next cycle"
+    },
+    "maintenance_extract_llm_budget_ratio": {
+      "description": "Extraction LLM Budget Ratio",
+      "hint": "Share of the per-cycle LLM call limit reserved for conversation extraction (segment + extract); the rest goes to existing-memory curation"
+    },
+    "maintenance_extract_conv2_enabled": {
+      "description": "ConversationV2 Fallback Extraction",
+      "hint": "Conversations without platform message history (e.g. private chats) fall back to LLM conversation records for extraction"
+    },
+    "maintenance_extract_conv2_chunk_messages": {
+      "description": "ConversationV2 Chunk Size",
+      "hint": "ConversationV2 records carry no timestamps; every N messages are cut into one candidate block"
+    }
+  }
+}

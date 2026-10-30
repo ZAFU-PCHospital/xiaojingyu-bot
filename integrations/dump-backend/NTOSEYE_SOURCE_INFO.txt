@@ -1,0 +1,5 @@
+Upstream https://github.com/dmaivel/ntoseye
+Tag v0.49.1
+Commit d30a43c069231678b508a66ade94dabcedc2bbaa
+Local adaptation in ntoseye-hospital.patch: optional lazy triage symbol loading; optional bounded symbol requests.
+Built locally in WSL using --locked --no-default-features --features cli -j 2; no server compilation.

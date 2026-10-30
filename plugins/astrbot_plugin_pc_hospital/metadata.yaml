@@ -1,0 +1,8 @@
+name: astrbot_plugin_pc_hospital
+display_name: 电脑医院客服工具
+desc: 客服上下文与dump；管理员自然语言案例入库、维护及检索闭环。
+version: v0.4.0
+author: Xiaoyuan
+support_platforms:
+  - aiocqhttp
+  - qq_official_webhook

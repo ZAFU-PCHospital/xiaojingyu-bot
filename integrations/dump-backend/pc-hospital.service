@@ -1,0 +1,35 @@
+[Unit]
+Description=PC Hospital restricted dump analysis backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pchospital
+Group=pchospital
+WorkingDirectory=/var/lib/pc-hospital
+ExecStart=/usr/bin/python3 /opt/pc-hospital/backend.py
+Restart=on-failure
+RestartSec=5
+StateDirectory=pc-hospital
+StateDirectoryMode=0700
+Environment=PYTHONDONTWRITEBYTECODE=1
+MemoryHigh=384M
+MemoryMax=512M
+MemorySwapMax=256M
+CPUQuota=100%
+TasksMax=32
+LimitFSIZE=768M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/var/lib/pc-hospital
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

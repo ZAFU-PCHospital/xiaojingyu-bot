@@ -1,0 +1,35 @@
+﻿name: astrbot_plugin_memewiki
+display_name: 梗百科
+short_desc: 内置 6668 条词条，毫秒级查梗；没收录才联网，同一个词不重复搜
+desc: |-
+  让 Bot 认得群里的梗和黑话，装完即用。
+
+  · 内置 6668 条词条数据库（SQLite，约 16MB），开箱即查，不联网也快
+  · 查词约 1–3ms：完整梗名精确匹配，未收录才回落 cnmeme.wiki 公开接口
+  · 消息像梗查询时自动预查并注入上下文，不依赖模型自觉
+  · 预查先查本地（0.1–0.9ms），只有真在问梗或像词条的短词才联网，闲聊不花钱
+  · 同一个词 10 分钟内只搜一次，重复词（杂鱼杂鱼/666）折叠后共用缓存
+  · 注入内容以「怎么用 / 怎么接」为先，让模型先接梗、后解释
+  · /梗 指令支持图片卡片（配置项下拉切换纯文字）
+  · /黑话 自建群内词条，独立于 wiki 词库
+  · WebUI 扩展页面可视化编辑黑话
+  · 可选每天自动更新词库（只补新增，不重抓全量），同步时刻可配
+version: 1.5.2
+author: in1t1a1
+repo: https://github.com/in1t1a1/astrbot_plugin_memewiki
+logo: https://raw.githubusercontent.com/in1t1a1/astrbot_plugin_memewiki/main/logo.png
+astrbot_version: ">=4.11.0"
+support_platforms:
+  - aiocqhttp
+  - telegram
+  - qq_official
+  - qq_official_webhook
+  - lark
+  - dingtalk
+tags:
+  - 梗
+  - 黑话
+  - 词库
+  - meme
+  - cnmeme
+social_link: https://github.com/in1t1a1

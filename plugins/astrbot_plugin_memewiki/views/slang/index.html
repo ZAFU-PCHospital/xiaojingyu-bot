@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>自定义黑话</title>
+<!-- 服务端会把这里的 src 替换成带 asset_token 的真实地址 -->
+<script src="/api/plugin/page/bridge-sdk.js"></script>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --text: #1f2937;
+    --muted: #6b7280;
+    --border: #e5e7eb;
+    --accent: #2563eb;
+    --danger: #dc2626;
+    --ok: #059669;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1420;
+      --panel: #171d2b;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --border: #2a3446;
+      --accent: #60a5fa;
+      --danger: #f87171;
+      --ok: #34d399;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 20px;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 18px; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  input, textarea, button { font: inherit; }
+  input[type="text"], textarea {
+    width: 100%;
+    padding: 9px 11px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text);
+    outline: none;
+  }
+  input[type="text"]:focus, textarea:focus { border-color: var(--accent); }
+  textarea { resize: vertical; min-height: 70px; }
+  .field { margin-bottom: 10px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  button {
+    padding: 8px 16px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:disabled { opacity: .55; cursor: default; }
+  button.del { padding: 4px 10px; font-size: 12px; color: var(--danger); border-color: var(--border); }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { font-size: 12px; color: var(--muted); font-weight: 600; }
+  td.name { font-weight: 600; white-space: nowrap; }
+  td.meta { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .status { margin-top: 10px; font-size: 13px; min-height: 18px; }
+  .status.ok { color: var(--ok); }
+  .status.err { color: var(--danger); }
+  .empty { color: var(--muted); text-align: center; padding: 24px 0; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>自定义黑话</h1>
+  <div class="sub">群内自造的黑话，独立于 wiki 词库保存。聊天里出现这些词时，机器人会按你写的含义理解。</div>
+
+  <div class="panel">
+    <div class="field">
+      <label for="name">黑话名称（2–16 字）</label>
+      <input id="name" type="text" placeholder="例：狗东" maxlength="16" />
+    </div>
+    <div class="field">
+      <label for="meaning">含义（1–300 字）</label>
+      <textarea id="meaning" placeholder="例：京东，群友调侃用" maxlength="300"></textarea>
+    </div>
+    <button class="primary" id="save">保存</button>
+    <button id="reset">清空</button>
+    <div class="status" id="status"></div>
+  </div>
+
+  <div class="panel">
+    <div class="row" style="justify-content: space-between; align-items: center; margin-bottom: 8px;">
+      <strong>已有黑话 <span id="count">0</span> 条</strong>
+      <button id="reload">刷新</button>
+    </div>
+    <table>
+      <thead>
+        <tr><th style="width:130px">名称</th><th>含义</th><th style="width:150px">记录人</th><th style="width:76px"></th></tr>
+      </thead>
+      <tbody id="tbody">
+        <tr><td colspan="4" class="empty">加载中…</td></tr>
+      </tbody>
+    </table>
+    <div class="hint">QQ 里也能加：<code>/黑话 名称 含义</code>；删除指令 <code>/黑话 删除 名称</code>（管理员）。</div>
+  </div>
+</div>
+
+<script>
+(function () {
+  var tbody = document.getElementById("tbody");
+  var statusEl = document.getElementById("status");
+  var countEl = document.getElementById("count");
+  var nameEl = document.getElementById("name");
+  var meaningEl = document.getElementById("meaning");
+  var bridge = null;
+
+  function setStatus(text, kind) {
+    statusEl.textContent = text || "";
+    statusEl.className = "status" + (kind ? " " + kind : "");
+  }
+
+  function getBridge() {
+    return window.AstrBotPluginPage || window.AstrBotPluginView || null;
+  }
+
+  function waitBridge(timeoutMs) {
+    return new Promise(function (resolve) {
+      var started = Date.now();
+      (function tick() {
+        var b = getBridge();
+        if (b) return resolve(b);
+        if (Date.now() - started > timeoutMs) return resolve(null);
+        setTimeout(tick, 100);
+      })();
+    });
+  }
+
+  function api(method, path, body) {
+    if (!bridge) throw new Error("bridge 不可用（请在 AstrBot WebUI 的插件页里打开）");
+    return method === "GET" ? bridge.apiGet(path) : bridge.apiPost(path, body);
+  }
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function render(items) {
+    countEl.textContent = items.length;
+    if (!items.length) {
+      tbody.innerHTML = '<tr><td colspan="4" class="empty">还没有黑话，上面加一条吧</td></tr>';
+      return;
+    }
+    tbody.innerHTML = items.map(function (it) {
+      var who = it.author ? (it.author + (it.author_name ? " / " + it.author_name : "")) : (it.author_name || "-");
+      return '<tr>' +
+        '<td class="name">' + esc(it.name) + '</td>' +
+        '<td>' + esc(it.meaning) + '</td>' +
+        '<td class="meta" title="' + esc(it.ts) + '">' + esc(who) + '</td>' +
+        '<td><button class="del" data-name="' + esc(it.name) + '">删除</button></td>' +
+      '</tr>';
+    }).join("");
+  }
+
+  async function load() {
+    try {
+      tbody.innerHTML = '<tr><td colspan="4" class="empty">加载中…</td></tr>';
+      var res = await api("GET", "terms");
+      var payload = res && res.data !== undefined ? res.data : res;
+      var items = (payload && payload.items) || [];
+      render(items);
+    } catch (e) {
+      tbody.innerHTML = '<tr><td colspan="4" class="empty">加载失败：' + esc(e.message || e) + '</td></tr>';
+    }
+  }
+
+  document.getElementById("save").addEventListener("click", async function () {
+    var name = nameEl.value.trim();
+    var meaning = meaningEl.value.trim();
+    if (name.length < 2) return setStatus("名称至少 2 个字", "err");
+    if (!meaning) return setStatus("含义不能为空", "err");
+    this.disabled = true;
+    setStatus("保存中…");
+    try {
+      var res = await api("POST", "terms/save", { name: name, meaning: meaning });
+      var payload = res && res.data !== undefined ? res.data : res;
+      if (payload && payload.status === "error") throw new Error(payload.message || "保存失败");
+      setStatus("已保存「" + name + "」", "ok");
+      nameEl.value = "";
+      meaningEl.value = "";
+      await load();
+    } catch (e) {
+      setStatus("保存失败：" + (e.message || e), "err");
+    } finally {
+      this.disabled = false;
+    }
+  });
+
+  document.getElementById("reset").addEventListener("click", function () {
+    nameEl.value = "";
+    meaningEl.value = "";
+    setStatus("");
+  });
+
+  document.getElementById("reload").addEventListener("click", load);
+
+  tbody.addEventListener("click", async function (ev) {
+    var btn = ev.target.closest("button.del");
+    if (!btn) return;
+    var name = btn.getAttribute("data-name");
+    if (!confirm("确定删除「" + name + "」？")) return;
+    btn.disabled = true;
+    try {
+      await api("POST", "terms/delete", { name: name });
+      setStatus("已删除「" + name + "」", "ok");
+      await load();
+    } catch (e) {
+      setStatus("删除失败：" + (e.message || e), "err");
+      btn.disabled = false;
+    }
+  });
+
+  if (!bridge && !getBridge()) {
+    setStatus("正在连接 AstrBot 面板…");
+  }
+  waitBridge(8000).then(function (b) {
+    bridge = b;
+    if (!b) {
+      setStatus("bridge 不可用：请从 AstrBot WebUI 的插件页面打开本页", "err");
+      tbody.innerHTML = '<tr><td colspan="4" class="empty">未连接面板，无法读取数据</td></tr>';
+      return;
+    }
+    // 等父页面完成握手后再请求
+    setTimeout(load, 300);
+  });
+})();
+</script>
+</body>
+</html>

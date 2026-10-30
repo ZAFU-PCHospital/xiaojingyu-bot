@@ -1,0 +1,52 @@
+{
+  "friend_sessions": {
+    "type": "list",
+    "description": "群友会话",
+    "default": []
+  },
+  "management_sessions": {
+    "type": "list",
+    "description": "管理会话",
+    "default": []
+  },
+  "hospital_sessions": {
+    "type": "list",
+    "description": "客服会话",
+    "default": []
+  },
+  "data_path": {
+    "type": "string",
+    "description": "持久数据目录",
+    "default": "data/plugin_data/whale_features"
+  },
+  "provider_id": {
+    "type": "string",
+    "description": "摘要模型",
+    "default": "workbuddy/cn:deepseek-v4-flash"
+  },
+  "notifications_enabled": {
+    "type": "bool",
+    "description": "启用经授权业务通知",
+    "default": true
+  },
+  "management_context_notifications": {
+    "type": "bool",
+    "description": "管理群通知等待普通新消息，通过真实回复上下文合并补发；@提问优先",
+    "default": true
+  },
+  "auto_links": {
+    "type": "bool",
+    "description": "群友链接自动AI摘要",
+    "default": true
+  },
+  "listener_port": {
+    "type": "int",
+    "description": "部署通知仅回环监听端口",
+    "default": 6196
+  },
+  "muted_github_deploy_sessions": {
+    "type": "list",
+    "description": "关闭GitHub和部署通知的管理会话；不影响其他提醒",
+    "default": []
+  }
+}

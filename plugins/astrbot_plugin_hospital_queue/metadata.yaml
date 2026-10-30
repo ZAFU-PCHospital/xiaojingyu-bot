@@ -1,0 +1,6 @@
+name: astrbot_plugin_hospital_queue
+display_name: 电脑医院活动排队
+desc: 客服群公开活动排队查询及限时播报
+version: v0.1.0
+author: Xiaoyuan
+repo: ""

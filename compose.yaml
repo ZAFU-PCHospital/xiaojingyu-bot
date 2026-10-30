@@ -1,0 +1,14 @@
+services:
+  astrbot:
+    build: .
+    image: xiaojingyu-astrbot:local
+    network_mode: host
+    restart: unless-stopped
+    mem_limit: 896m
+    volumes:
+      - ./data:/AstrBot/data
+    environment:
+      TZ: Asia/Shanghai
+      WHALE_ANNOUNCEMENT_GROUP_IDS: ${WHALE_ANNOUNCEMENT_GROUP_IDS:-}
+      WHALE_BACKUP_GROUP_UMO: ${WHALE_BACKUP_GROUP_UMO:-}
+      WHALE_BACKUP_SOURCE_HOST: ${WHALE_BACKUP_SOURCE_HOST:-}

@@ -1,0 +1,28 @@
+[Unit]
+Description=WorkBuddy2API private gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=workbuddy
+Group=workbuddy
+WorkingDirectory=/opt/bot-stack/workbuddy
+ExecStart=/opt/bot-stack/workbuddy/wb2api -config /opt/bot-stack/workbuddy/config.json
+Restart=on-failure
+RestartSec=5
+UMask=0077
+Environment=TZ=Asia/Shanghai
+Environment=GOMEMLIMIT=160MiB
+Environment=GOMAXPROCS=2
+MemoryHigh=192M
+MemoryMax=256M
+CPUQuota=100%
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/bot-stack/workbuddy
+ProtectHome=yes
+PrivateTmp=yes
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,47 @@
+diff --git a/src/symbols/download.rs b/src/symbols/download.rs
+index 0c2e314..9ee9164 100644
+--- a/src/symbols/download.rs
++++ b/src/symbols/download.rs
+@@ -131,7 +131,17 @@ pub(super) fn download_job(job: &DownloadJob, pb: ProgressBar) -> Result<()> {
+ }
+ 
+ fn download_url_to_path(url: &str, path: &Path, filename: &str, pb: &ProgressBar) -> Result<()> {
+-    let response = reqwest::blocking::get(url)?;
++    // Bound a deployment's symbol-server requests; unchanged upstream default
++    // when the environment variable is absent.
++    let response = if let Ok(seconds) = std::env::var("PC_HOSPITAL_SYMBOL_TIMEOUT_SECS") {
++        let seconds = seconds.parse::<u64>().unwrap_or(12).clamp(1, 60);
++        reqwest::blocking::Client::builder()
++            .connect_timeout(std::time::Duration::from_secs(5))
++            .timeout(std::time::Duration::from_secs(seconds))
++            .build()?.get(url).send()?
++    } else {
++        reqwest::blocking::get(url)?
++    };
+     let response = response.error_for_status()?;
+     let total_size = response.content_length().unwrap_or(0);
+ 
+diff --git a/src/target/lifecycle.rs b/src/target/lifecycle.rs
+index baba22b..b364909 100644
+--- a/src/target/lifecycle.rs
++++ b/src/target/lifecycle.rs
+@@ -94,12 +94,17 @@ impl Target {
+         // A triage dump seldom holds PsLoadedModuleList even when it holds
+         // the kernel; its driver list names the modules then, as it does for
+         // `kernel_modules()`.
+-        let loaded = guest.as_ref().is_some_and(|guest| {
++        // PC Hospital deployment: leave symbols lazy for small dumps. The
++        // unwinder already loads modules it touches; do not prefetch an entire
++        // machine's drivers before answering one crash-analysis request.
++        let lazy_triage = phys.dmp_info().is_some_and(|info| info.is_triage)
++            && std::env::var_os("PC_HOSPITAL_LAZY_TRIAGE").is_some();
++        let loaded = !lazy_triage && guest.as_ref().is_some_and(|guest| {
+             guest
+                 .load_all_kernel_module_symbols(&phys, &symbols)
+                 .is_ok()
+         });
+-        if !loaded && let Some(modules) = &triage_modules {
++        if !lazy_triage && !loaded && let Some(modules) = &triage_modules {
+             let arch = phys
+                 .dmp_info()
+                 .and_then(DmpInfo::arch)

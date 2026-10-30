@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Send only allowlisted backup status metadata; never transmit raw error text."""
+import datetime as dt
+import fcntl
+import json
+import os
+from pathlib import Path
+import shlex
+import socket
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+
+CONFIG = Path('/etc/zafu-backup.conf')
+TOKEN_FILE = Path('/etc/zafu-backup-alert.secret')
+STATE_ROOT = Path('/var/lib/zafu-backup-alert')
+SETTINGS_FILE = Path('/etc/zafu-backup-alert.settings.json')
+
+def setting(path, wanted, fallback):
+    value = fallback
+    with path.open(encoding='utf8') as stream:
+        for line in stream:
+            s = line.strip()
+            if not s.startswith(wanted+'='):
+                continue
+            parts = shlex.split(s.split('=',1)[1],comments=True)
+            value = parts[0] if len(parts) == 1 else fallback
+    return value
+
+def reason_for(status, summary):
+    if status == 'success':return 'success'
+    for words,reason in [(['备份告警联调'],'test'),(['可用空间不足'],'space'),
+        (['磁盘使用率'],'disk_usage'),(['超过上限'],'capacity'),(['容器未运行'],'container'),
+        (['数据库备份','mysqldump'],'database'),(['打包','备份文件包','配置包'],'files'),
+        (['目录不存在','环境文件不存在'],'prerequisite')]:
+        if any(w in summary for w in words):return reason
+    return 'unexpected'
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self,*args,**kwargs):return None
+
+def main():
+    if os.geteuid() != 0 or len(sys.argv) != 3 or sys.argv[1] not in ('success','failure'):
+        return 2
+    status, reason = sys.argv[1], reason_for(sys.argv[1],sys.argv[2])
+    conf = Path(os.environ.get('ZAFU_BACKUP_CONFIG',str(CONFIG)))
+    state_dir = Path(setting(conf,'STATE_DIR','/var/lib/zafu-backup'))
+    backup_root = Path(setting(conf,'BACKUP_ROOT','/opt/zafu-pchospital-backups/scheduled'))
+    now = dt.datetime.now(dt.timezone.utc)
+    stamp = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+    free = None
+    try:
+        st = os.statvfs(backup_root)
+        free = st.f_bavail * st.f_frsize
+    except OSError:
+        pass
+    try:
+        state = json.loads((state_dir/'status.json').read_text(encoding='utf8'))
+        when = dt.datetime.fromisoformat(str(state.get('finished_at','')).replace('Z','+00:00'))
+        if state.get('status') == status and when.tzinfo and abs((now-when).total_seconds()) < 300:
+            stamp = when.astimezone(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            disk = state.get('disk_free_bytes')
+            if type(disk) is int and disk >= 0:free = disk
+    except (OSError,ValueError,TypeError):
+        pass
+    settings = json.loads(SETTINGS_FILE.read_text(encoding='utf8'))
+    url = settings['url']
+    if not isinstance(url,str) or not url.startswith('https://'):
+        raise ValueError('HTTPS alert URL required')
+    payload = {'event_id':str(uuid.uuid4()),'status':status,'host':socket.gethostname(),
+               'finished_at':stamp,'disk_free_bytes':free,'reason':reason}
+    STATE_ROOT.mkdir(mode=0o700,parents=True,exist_ok=True)
+    with (STATE_ROOT/'lock').open('a') as lock:
+        os.chmod(STATE_ROOT/'lock',0o600)
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        rate_file=STATE_ROOT/'rate.json'
+        try: rate=json.loads(rate_file.read_text(encoding='utf8'))
+        except (OSError,ValueError):rate={}
+        key=status+':'+reason
+        if time.time()-float(rate.get(key,0)) < 1800:
+            print('backup alert suppressed by rate limit')
+            return 0
+        token=TOKEN_FILE.read_text(encoding='utf8').strip()
+        opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect())
+        req=urllib.request.Request(url,data=json.dumps(payload).encode(),method='POST',
+             headers={'Content-Type':'application/json','Authorization':'Bearer '+token})
+        try:
+            with opener.open(req,timeout=12) as response:
+                result=json.load(response)
+            delivery=result.get('state','unknown')
+        except urllib.error.HTTPError:
+            print('backup alert rejected',file=sys.stderr)
+            return 1
+        except (TimeoutError,OSError,ValueError):
+            delivery='unknown'
+        rate[key]=time.time()
+        fd=os.open(rate_file,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+        with os.fdopen(fd,'w',encoding='utf8') as f:json.dump(rate,f)
+        print('backup alert delivery: '+delivery if delivery in ('accepted','rejected','unknown','pending','sending') else 'backup alert delivery: unknown')
+        return 0 if delivery=='accepted' else 1
+
+if __name__=='__main__':
+    try:sys.exit(main())
+    except Exception:
+        print('backup alert failed',file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,11 @@
+{
+  "metadata": {
+    "display_name": "梗百科"
+  },
+  "pages": {
+    "slang": {
+      "title": "自定义黑话",
+      "description": "编辑群内自造的黑话，和 wiki 词库分开保存"
+    }
+  }
+}

@@ -1,0 +1,26 @@
+# Replace YOUR_BOT_DOMAIN and certificate paths after issuing a certificate.
+# Add this map inside nginx's http block.
+map $http_upgrade $whale_connection { default upgrade; '' close; }
+
+# Add the following locations inside the HTTPS server block; the dashboard and QQ webhook share 6185.
+location = /integrations/whale-deploy {
+    client_max_body_size 4k;
+    proxy_set_header Authorization $http_authorization;
+    proxy_pass http://127.0.0.1:6196/deploy;
+}
+location ^~ /integrations/whale-deploy/ {
+    client_max_body_size 4k;
+    proxy_set_header Authorization $http_authorization;
+    proxy_pass http://127.0.0.1:6196/deploy/;
+}
+location / {
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $whale_connection;
+    proxy_buffering off;
+    proxy_read_timeout 3600s;
+    proxy_pass http://127.0.0.1:6185;
+}

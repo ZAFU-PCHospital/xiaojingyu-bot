@@ -1,0 +1,9 @@
+{
+  "enabled_groups": {"description":"启用的群号","type":"list","default":[]},
+  "knowledge_kb_name": {"description":"电脑医院原生知识库名称（空则关闭）","type":"string","default":""},
+  "backend_url": {"description":"本机dump后端","type":"string","default":"http://127.0.0.1:6197"},
+  "backend_token": {"description":"后端访问密钥","type":"string","default":""},
+  "context_limit": {"description":"每群内存文字缓存条数（不按时间清空），普通问答仍只带少量近期消息","type":"int","default":80},
+  "share_cases": {"description":"已启用客服群共享脱敏案例正文；原始聊天、来源证据和文件仍按群隔离","type":"bool","default":false},
+  "auto_knowledge_enabled": {"description":"自动整理已启用客服群的技术案例（后台静默处理）","type":"bool","default":false}
+}

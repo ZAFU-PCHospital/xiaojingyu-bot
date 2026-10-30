@@ -1,0 +1,65 @@
+[
+  {
+    "plugin": "astrbot_plugin_memewiki",
+    "path": "data/memes.db",
+    "repository": "in1t1a1/astrbot_plugin_memewiki",
+    "commit": "386dd63ed889251253576d44066c6de8d476f4f7",
+    "sha256": "05d902ff642dbb894fe2fa61b7623ca9c094cc2e6d26d2f818986296cdacdef3",
+    "mirrors": [
+      {
+        "repository": "Liujelly/dsh-memewiki",
+        "commit": "1d3f8266468823fe85290a016eadf3b8d1262de3"
+      }
+    ]
+  },
+  {
+    "plugin": "astrbot_plugin_memewiki",
+    "path": "logo.png",
+    "repository": "in1t1a1/astrbot_plugin_memewiki",
+    "commit": "386dd63ed889251253576d44066c6de8d476f4f7",
+    "sha256": "4d6970fa5bfcfc0024eb80e97b9aaa41c452f1a155cd6e297a3a839ddf062669",
+    "optional": true
+  },
+  {
+    "plugin": "meme_manager",
+    "path": "logo.png",
+    "repository": "anka-afk/astrbot_plugin_meme_manager",
+    "commit": "cf18e81c84fb3a713320addd57e56014d499f65c",
+    "sha256": "e31b56ccd0e749f13a72ae2fc8d0f6c60381b2ae71ff73b404473c0ca513796b"
+  },
+  {
+    "plugin": "meme_manager",
+    "path": "logo-legacy.png",
+    "repository": "anka-afk/astrbot_plugin_meme_manager",
+    "commit": "cf18e81c84fb3a713320addd57e56014d499f65c",
+    "sha256": "f24af05bd8ee5d4636eed8020c15c5dde3e2ca26cc899aad18c988a7e62cccd0"
+  },
+  {
+    "plugin": "meme_manager",
+    "path": "pages/app/shared/webfonts/fa-brands-400.woff2",
+    "repository": "anka-afk/astrbot_plugin_meme_manager",
+    "commit": "cf18e81c84fb3a713320addd57e56014d499f65c",
+    "sha256": "748332090c4b8e20f95d0ff59f0be20fa9c889359d3b36d4b886d73376054207"
+  },
+  {
+    "plugin": "meme_manager",
+    "path": "pages/app/shared/webfonts/fa-regular-400.woff2",
+    "repository": "anka-afk/astrbot_plugin_meme_manager",
+    "commit": "cf18e81c84fb3a713320addd57e56014d499f65c",
+    "sha256": "8e7e5ea1b15f62ab14dbd41768e8fbcd21cc859a4ea5da812457ee714299fb35"
+  },
+  {
+    "plugin": "meme_manager",
+    "path": "pages/app/shared/webfonts/fa-solid-900.woff2",
+    "repository": "anka-afk/astrbot_plugin_meme_manager",
+    "commit": "cf18e81c84fb3a713320addd57e56014d499f65c",
+    "sha256": "7152a6933ee3d690ec2af3d09da9d701723d16aa3410a6d80f28ff8866f3b880"
+  },
+  {
+    "plugin": "meme_manager",
+    "path": "pages/app/shared/webfonts/fa-v4compatibility.woff2",
+    "repository": "anka-afk/astrbot_plugin_meme_manager",
+    "commit": "cf18e81c84fb3a713320addd57e56014d499f65c",
+    "sha256": "694a17c3d9d6c05f8aac63c544615552a4b220e9a4de863d87341a6bcfc1bc8d"
+  }
+]

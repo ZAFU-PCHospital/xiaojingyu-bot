@@ -1,0 +1,6 @@
+{
+  "enabled": {"description": "启用排队查询", "type": "bool", "default": false},
+  "broadcast_enabled": {"description": "启用活动开始后每15分钟播报", "type": "bool", "default": false},
+  "sessions": {"description": "允许查询与播报的客服群会话", "type": "list", "default": []},
+  "data_path": {"description": "播报去重数据目录", "type": "string", "default": "data/plugin_data/hospital_queue"}
+}

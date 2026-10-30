@@ -1,0 +1,78 @@
+{
+  "reply_mode": {
+    "description": "/梗 指令的回复形式",
+    "type": "string",
+    "options": [
+      "image",
+      "text"
+    ],
+    "labels": [
+      "图片卡片（推荐）",
+      "纯文字"
+    ],
+    "hint": "图片卡片 = 渲染成一张带用法/出处的梗卡；纯文字 = 直接刷一段文字。默认图片卡片。",
+    "default": "image"
+  },
+  "auto_sync_enable": {
+    "description": "每天自动同步词库",
+    "type": "bool",
+    "hint": "开启后，每天指定时间运行 scripts/sync_memes.py 抓取新词条并重建词库。只补新增，通常几分钟；数据写到 data/plugin_data/astrbot_plugin_memewiki/。",
+    "default": false
+  },
+  "auto_sync_hour": {
+    "description": "同步时刻（0-23 点）",
+    "type": "int",
+    "hint": "默认 4，即每天凌晨 4 点开始。",
+    "default": 4
+  },
+  "inject_guidance": {
+    "description": "自动注入「用法说明」",
+    "type": "bool",
+    "hint": "开启后，每次请求会附带一小段规则（先查梗、先接梗别科普、查不到别编、别用客服腔），用户不需要改人设。默认开启。",
+    "default": true
+  },
+  "guidance_text": {
+    "description": "自定义用法说明",
+    "type": "text",
+    "hint": "留空使用内置文案；填了就用你的内容替换整段（会额外占用 prompt）。",
+    "default": ""
+  },
+  "search_mode": {
+    "description": "词库没收录时怎么联网",
+    "type": "string",
+    "options": [
+      "auto",
+      "plugin",
+      "model",
+      "off"
+    ],
+    "labels": [
+      "自动：插件先搜，搜不到再提示模型（推荐）",
+      "只插件代搜",
+      "只提示模型自己搜",
+      "完全关闭"
+    ],
+    "hint": "插件不存 API Key：代搜用的是你在 AstrBot「配置 → 网页搜索」里配好的服务商，没配就跳过。auto 最省心；聊天里用 /网搜 设置过的话，以 /网搜 为准。",
+    "default": "auto"
+  },
+  "search_max_chars": {
+    "description": "触发联网的最大字数",
+    "type": "int",
+    "hint": "不是明确在问梗时，只有不超过这个字数的短词才会联网；整句闲聊不搜。默认 10。",
+    "default": 10
+  },
+  "search_timeout": {
+    "description": "搜索超时（秒）",
+    "type": "float",
+    "hint": "超过这个时间就放弃搜索，直接按“没查到”处理，避免拖慢回复。默认 6 秒。",
+    "default": 6.0
+  },
+  "enabled_sessions": {
+    "description": "允许使用梗百科的群友会话",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": []
+  }
+}
