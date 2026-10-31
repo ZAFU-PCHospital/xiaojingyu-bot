@@ -1,6 +1,8 @@
 /.env
 /data/
 /secrets/
+/config/group-mapping.json
+/config/local*
 /.local/
 **/__pycache__/
 *.py[cod]
