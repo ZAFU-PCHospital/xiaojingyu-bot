@@ -15,6 +15,18 @@ from .core import DECISION_PROMPT, READ_TOOLS, SILENT, classify, parse_decision
 
 FLAG = '_hospital_proactive_candidate'
 RESOLVED = '[WHALE_RESOLVED]'
+PROACTIVE_HINT = '`如需继续提问，请 @ 我`'
+
+
+def interval_open(last_at, now, interval):
+    return interval <= 0 or last_at <= 0 or now - last_at >= interval
+
+
+def with_proactive_hint(text):
+    text = (text or '').rstrip()
+    if text.endswith(PROACTIVE_HINT):
+        return text
+    return (text + '\n\n' if text else '') + PROACTIVE_HINT
 
 @register('astrbot_plugin_hospital_proactive', 'Xiaoyuan', '三分类候选、主模型明确决定是否发送；@独立保留', '0.3.0')
 class HospitalProactive(Star):
@@ -50,19 +62,23 @@ class HospitalProactive(Star):
     def enabled(self, event):
         return bool(self.config.get('enabled', False) and event.unified_msg_origin in self.config.get('enabled_sessions', []))
 
+    def reply_interval(self):
+        try: return max(0, int(self.config.get('user_reply_interval_seconds', 3600)))
+        except (TypeError, ValueError): return 3600
+
     @staticmethod
     def addressed(event):
         return any(isinstance(x, At) and str(x.qq) == str(event.get_self_id()) for x in event.get_messages())
 
     def user(self, event):
         now = time.monotonic()
-        self.users = {k:v for k,v in self.users.items() if now-v['touched'] < 900 or v['lock'].locked()}
+        self.users = {k:v for k,v in self.users.items() if now-v['touched'] < max(900, self.reply_interval()) or v['lock'].locked()}
         key = (event.unified_msg_origin, str(event.get_sender_id()))
         if key not in self.users:
             if len(self.users) >= 1000:
                 idle = next((k for k,v in self.users.items() if not v['lock'].locked()), None)
                 if idle is not None: del self.users[idle]
-            self.users[key] = {'until':0, 'context_until':0, 'touched':now, 'messages':deque(maxlen=4), 'lock':asyncio.Lock()}
+            self.users[key] = {'until':0, 'context_until':0, 'last_proactive_at':0, 'touched':now, 'messages':deque(maxlen=4), 'lock':asyncio.Lock()}
         self.users[key]['touched'] = now
         return self.users[key]
 
@@ -90,6 +106,9 @@ class HospitalProactive(Star):
         except TimeoutError: self.count(limit_user_queue=1); return
         handed_off, acquired_agent = False, False
         try:
+            if not interval_open(state.get('last_proactive_at', 0), time.monotonic(), self.reply_interval()):
+                self.count(_origin=event.unified_msg_origin,limit_user_interval=1)
+                self.trace(event,'route','user_interval'); return
             normalized=''.join(text.casefold().split())
             if normalized and state.get('last_answered_text')==normalized and state.get('last_answered_until',0)>time.monotonic():
                 self.count(_origin=event.unified_msg_origin,skip_repeat=1)
@@ -193,7 +212,7 @@ class HospitalProactive(Star):
             window.append(now)
             try:
                 from data.plugins.astrbot_plugin_pc_hospital.policy import with_disclaimer
-                text=with_disclaimer(answer)
+                text=with_proactive_hint(with_disclaimer(answer))
                 await asyncio.wait_for(event.send(event.plain_result(text)),timeout=25)
                 if getattr(event,'_has_send_oper',False):
                     state=self.user(event)
@@ -202,6 +221,7 @@ class HospitalProactive(Star):
                     state['until']=state['context_until']
                     state['last_answered_text']=''.join(event.get_extra('_hospital_help_input','').casefold().split())
                     state['last_answered_until']=time.monotonic()+600
+                    state['last_proactive_at']=time.monotonic()
                     event.set_extra('_hospital_proactive_replied',True)
                     self.count(_origin=event.unified_msg_origin,replies=1)
                     self.trace(event,'direct_send','submitted')

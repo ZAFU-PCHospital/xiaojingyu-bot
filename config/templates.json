@@ -163,6 +163,7 @@
       ],
       "model": "cn:hy3",
       "help_ttl_seconds": 600,
+      "user_reply_interval_seconds": 3600,
       "daily_classifier_limit": 0,
       "classifier_timeout_seconds": 20,
       "max_input_chars": 4000,
