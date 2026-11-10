@@ -1,4 +1,4 @@
-"""Public queue lookup and bounded activity notifications for hospital groups."""
+"""Public queue lookup and activity-window notifications for hospital groups."""
 import asyncio
 import json
 import re
@@ -16,8 +16,14 @@ from astrbot.core.message.components import At, Plain
 from .queue_core import ORIGIN, activity_url, broadcast_notice, notice, parse_observation, queue_url
 
 
+ALLOWED_SESSIONS = frozenset({
+    'default_1905841527:GroupMessage:CC708D9151B7F4AA5D825F99CD9FD6DB',  # test
+    'default_1905841527:GroupMessage:EB1BD0DD086D618383E6D72C48CBA495',  # 1071838740
+    'default_1905841527:GroupMessage:8B91E482008FE031B61F57D33FCA3111',  # 532502904
+    'default_1905841527:GroupMessage:C71A0891377CEACA89F20E39396E12C1',  # 一群
+})
 INTERVAL = timedelta(minutes=15)
-WINDOW = timedelta(hours=2)
+FALLBACK_WINDOW = timedelta(hours=2)
 GRACE = timedelta(minutes=2)
 
 
@@ -35,6 +41,21 @@ def activity_start(row):
         return None
 
 
+def activity_end(row):
+    start = activity_start(row)
+    if start is None:
+        return None
+    value = row.get('endsAt')
+    if isinstance(value, str):
+        try:
+            end = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            if end.tzinfo is not None and end.utcoffset() is not None:
+                return end.astimezone(timezone.utc)
+        except ValueError:
+            pass
+    return start + FALLBACK_WINDOW
+
+
 def valid_activity(row):
     try:
         activity_url(row['id'])
@@ -43,20 +64,28 @@ def valid_activity(row):
         return False
 
 
-def due_slot(start, now):
-    """Eight nominal slots, 15–120 min; never replay missed old slots."""
-    for index in range(1, 9):
-        target = start + index * INTERVAL
-        if target <= now < target + GRACE:
-            return index
+def due_slot(start, end, now):
+    """15-minute slots from activity start through its end; never replay missed slots."""
+    if end <= start or now < start + INTERVAL:
+        return None
+    index = int((now - start) // INTERVAL)
+    target = start + index * INTERVAL
+    if target <= end and target <= now < target + GRACE:
+        return index
     return None
+
+
+def has_waiting(observation):
+    return (not isinstance(observation, str)
+            and observation.waiting_count is not None
+            and observation.waiting_count > 0)
 
 
 def candidate_activities(rows, now):
     """Prefer the current activity; do not guess if there are several."""
     items = [r for r in rows if isinstance(r, dict) and valid_activity(r) and r.get('status') != 'ENDED']
-    # The website, rather than the two-hour broadcast limit, defines whether
-    # an activity has ended for on-demand questions.
+    # The website's status, not the broadcast window, defines whether an
+    # activity has ended for on-demand questions.
     current = [r for r in items if activity_start(r) <= now]
     if current:
         return current
@@ -84,7 +113,7 @@ class HospitalQueue(Star):
         self.job = None
 
     def sessions(self):
-        return list(dict.fromkeys(str(x) for x in self.config.get('sessions', []) if re.fullmatch(r'[^:]+:GroupMessage:[0-9A-Fa-f]{32}', str(x))))
+        return list(dict.fromkeys(str(x) for x in self.config.get('sessions', []) if str(x) in ALLOWED_SESSIONS))
 
     def allowed(self, event):
         return bool(self.config.get('enabled', False) and event.unified_msg_origin in self.sessions())
@@ -216,7 +245,7 @@ class HospitalQueue(Star):
         try:
             from data.plugins.astrbot_plugin_management_whale.announcements import send_once
             platform, kind, openid = origin.split(':', 2)
-            if kind != 'GroupMessage' or origin not in self.sessions():
+            if kind != 'GroupMessage' or origin not in ALLOWED_SESSIONS:
                 raise ValueError('invalid target')
             mid = await send_once(self.context, platform, openid, body)
             if not mid:
@@ -244,12 +273,13 @@ class HospitalQueue(Star):
             if not isinstance(row, dict) or not valid_activity(row) or row.get('status') == 'ENDED':
                 continue
             start = activity_start(row)
-            slot = due_slot(start, now)
+            end = activity_end(row)
+            slot = due_slot(start, end, now)
             if slot is None:
                 continue
             try:
                 obs = await self.observation(row['id'])
-                if isinstance(obs, str) or obs.waiting_count is None:
+                if not has_waiting(obs):
                     continue
                 body = broadcast_notice(obs)
                 await asyncio.gather(*(self.send_one(row['id'], start, slot, origin, body) for origin in self.sessions()))
